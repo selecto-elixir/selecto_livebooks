@@ -70,6 +70,10 @@ product_domain = %{
       supplier_id: %{type: :integer},
       inserted_at: %{type: :utc_datetime},
       updated_at: %{type: :utc_datetime}
+    },
+    associations: %{
+      category: %{queryable: :categories, owner_key: :category_id, related_key: :id},
+      supplier: %{queryable: :suppliers, owner_key: :supplier_id, related_key: :id}
     }
   },
   schemas: %{
@@ -149,6 +153,10 @@ order_domain = %{
       delivered_at: %{type: :utc_datetime},
       inserted_at: %{type: :utc_datetime, label: "Order Date"},
       updated_at: %{type: :utc_datetime}
+    },
+    associations: %{
+      customer: %{queryable: :customers, owner_key: :customer_id, related_key: :id},
+      order_items: %{queryable: :order_items, owner_key: :id, related_key: :order_id}
     }
   },
   schemas: %{
@@ -255,6 +263,9 @@ employee_domain = %{
       manager_id: %{type: :integer},
       inserted_at: %{type: :utc_datetime},
       updated_at: %{type: :utc_datetime}
+    },
+    associations: %{
+      manager: %{queryable: :employees, owner_key: :manager_id, related_key: :id}
     }
   },
   schemas: %{
@@ -305,6 +316,9 @@ order_items_domain = %{
       line_total: %{type: :decimal},
       order_id: %{type: :integer},
       product_id: %{type: :integer}
+    },
+    associations: %{
+      product: %{queryable: :products, owner_key: :product_id, related_key: :id}
     }
   },
   schemas: %{
