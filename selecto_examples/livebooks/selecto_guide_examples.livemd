@@ -523,7 +523,7 @@ selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["order_number", "status", "shipped_at"])
-|> Selecto.filter({"shipped_at", :is_not_null})
+|> Selecto.filter({"shipped_at", :not_null})
 |> Selecto.limit(10)
 |> Selecto.execute()
 
