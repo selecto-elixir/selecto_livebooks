@@ -377,7 +377,7 @@ config
 
 ```elixir
 # Simple field selection
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "sku", "price", "stock_quantity"])
@@ -399,7 +399,7 @@ end
 ### Select with Joins (dot notation)
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "price", "category.name", "supplier.company_name"])
@@ -423,7 +423,7 @@ end
 ### Simple Equality Filter
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "price", "active"])
@@ -442,7 +442,7 @@ end
 ### Comparison Operators
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "price", "stock_quantity"])
@@ -463,7 +463,7 @@ end
 ### Pattern Matching with LIKE/ILIKE
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "sku", "price"])
@@ -481,7 +481,7 @@ end
 ### IN Operator
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["order_number", "status", "total"])
@@ -500,7 +500,7 @@ end
 ### BETWEEN Filter
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "price"])
@@ -519,7 +519,7 @@ end
 ### NULL Checks
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["order_number", "status", "shipped_at"])
@@ -538,7 +538,7 @@ end
 ### OR Conditions
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["order_number", "status", "total"])
@@ -562,7 +562,7 @@ end
 ### Sorting Results
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "category.name", "price"])
@@ -589,7 +589,7 @@ end
 page = 2
 per_page = 10
 
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select(["name", "sku", "price"])
@@ -611,7 +611,7 @@ end
 ### Simple Aggregates
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -638,7 +638,7 @@ end
 ### Group By with Aggregates
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -666,7 +666,7 @@ end
 ### Count Distinct
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -694,7 +694,7 @@ end
 ### Basic Joins (automatic via dot notation)
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -721,7 +721,7 @@ end
 ### Orders by Customer Tier
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -747,7 +747,7 @@ end
 ## Section 6: Employees with Manager (Self-Join)
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.employee_domain, config.repo)
+selecto = Selecto.configure(config.employee_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -778,7 +778,7 @@ end
 ### Sales by Status
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+selecto = Selecto.configure(config.order_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -804,7 +804,7 @@ end
 ### Top Selling Products (via Order Items)
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.order_items_domain, config.repo)
+selecto = Selecto.configure(config.order_items_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -831,7 +831,7 @@ end
 ### Department Salary Summary
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.employee_domain, config.repo)
+selecto = Selecto.configure(config.employee_domain, config.repo)
 
 result = selecto
 |> Selecto.select([
@@ -868,7 +868,7 @@ end
 ```elixir
 defmodule ProductQueries do
   def base_query(repo, domain) do
-    {:ok, selecto} = Selecto.configure(domain, repo)
+    selecto = Selecto.configure(domain, repo)
     selecto
   end
 
@@ -914,7 +914,7 @@ end
 ```elixir
 defmodule ProductSearch do
   def search(repo, domain, params \\ %{}) do
-    {:ok, selecto} = Selecto.configure(domain, repo)
+    selecto = Selecto.configure(domain, repo)
 
     selecto
     |> Selecto.select(["id", "name", "sku", "price", "stock_quantity", "category.name"])
@@ -990,7 +990,7 @@ Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
 ### Transform to Maps
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 {:ok, {rows, columns, aliases}} = selecto
 |> Selecto.select(["name", "sku", "price", "stock_quantity"])
@@ -1011,7 +1011,7 @@ end)
 ### Create a Summary Table with Kino
 
 ```elixir
-{:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+selecto = Selecto.configure(config.product_domain, config.repo)
 
 {:ok, {rows, columns, _}} = selecto
 |> Selecto.select(["name", "sku", "price", "stock_quantity", "category.name"])
@@ -1063,7 +1063,7 @@ defmodule SalesDashboard do
   end
 
   defp show_overall_stats(config) do
-    {:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+    selecto = Selecto.configure(config.order_domain, config.repo)
 
     {:ok, {[[orders, customers, revenue, avg]], _, _}} = selecto
     |> Selecto.select([
@@ -1081,7 +1081,7 @@ defmodule SalesDashboard do
   end
 
   defp show_status_breakdown(config) do
-    {:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+    selecto = Selecto.configure(config.order_domain, config.repo)
 
     {:ok, {rows, _, _}} = selecto
     |> Selecto.select([
@@ -1099,7 +1099,7 @@ defmodule SalesDashboard do
   end
 
   defp show_tier_analysis(config) do
-    {:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+    selecto = Selecto.configure(config.order_domain, config.repo)
 
     {:ok, {rows, _, _}} = selecto
     |> Selecto.select([
@@ -1118,7 +1118,7 @@ defmodule SalesDashboard do
   end
 
   defp show_top_customers(config) do
-    {:ok, selecto} = Selecto.configure(config.order_domain, config.repo)
+    selecto = Selecto.configure(config.order_domain, config.repo)
 
     {:ok, {rows, _, _}} = selecto
     |> Selecto.select([
@@ -1138,7 +1138,7 @@ defmodule SalesDashboard do
   end
 
   defp show_category_summary(config) do
-    {:ok, selecto} = Selecto.configure(config.product_domain, config.repo)
+    selecto = Selecto.configure(config.product_domain, config.repo)
 
     {:ok, {rows, _, _}} = selecto
     |> Selecto.select([
