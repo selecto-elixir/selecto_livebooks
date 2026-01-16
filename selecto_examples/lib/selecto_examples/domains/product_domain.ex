@@ -42,6 +42,7 @@ defmodule SelectoExamples.Domains.ProductDomain do
           source_table: "categories",
           primary_key: :id,
           fields: [:id, :name, :description, :slug, :active],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             name: %{type: :string, label: "Category Name"},
@@ -54,6 +55,7 @@ defmodule SelectoExamples.Domains.ProductDomain do
           source_table: "suppliers",
           primary_key: :id,
           fields: [:id, :company_name, :contact_name, :email, :phone, :city, :country, :active],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             company_name: %{type: :string, label: "Company"},

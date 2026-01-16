@@ -45,6 +45,7 @@ defmodule SelectoExamples.Domains.OrderDomain do
           source_table: "customers",
           primary_key: :id,
           fields: [:id, :name, :email, :phone, :tier, :company_name, :city, :country, :active],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             name: %{type: :string, label: "Customer Name"},
@@ -62,6 +63,7 @@ defmodule SelectoExamples.Domains.OrderDomain do
           primary_key: :id,
           fields: [:id, :quantity, :unit_price, :discount, :line_total, :line_number,
                    :order_id, :product_id],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             quantity: %{type: :integer},
@@ -77,6 +79,7 @@ defmodule SelectoExamples.Domains.OrderDomain do
           source_table: "products",
           primary_key: :id,
           fields: [:id, :name, :sku, :price, :category_id],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             name: %{type: :string},

@@ -36,6 +36,7 @@ defmodule SelectoExamples.Domains.EmployeeDomain do
           primary_key: :id,
           fields: [:id, :first_name, :last_name, :email, :title, :department,
                    :hire_date, :salary, :active, :manager_id],
+          redact_fields: [],
           columns: %{
             id: %{type: :integer},
             first_name: %{type: :string},
