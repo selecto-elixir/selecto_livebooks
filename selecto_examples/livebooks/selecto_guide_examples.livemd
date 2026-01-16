@@ -1,0 +1,1166 @@
+# Selecto Guide - Interactive Examples
+
+```elixir
+Mix.install([
+  {:selecto, path: Path.expand("../../../selecto", __DIR__)},
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+```
+
+## Introduction
+
+This Livebook demonstrates all the examples from the **Selecto Guide**. Selecto is a powerful, composable SQL query builder for Elixir that generates parameterized queries from declarative domain configurations.
+
+Before running these examples, make sure you have:
+
+1. Set up the `selecto_examples` database
+2. Run the migrations and seeds
+
+```bash
+cd vendor/selecto_livebooks/selecto_examples
+mix setup
+```
+
+## Database Connection
+
+```elixir
+# Configure and start the Repo
+defmodule SelectoExamples.Repo do
+  use Ecto.Repo,
+    otp_app: :selecto_examples,
+    adapter: Ecto.Adapters.Postgres
+end
+
+# Start the repo with connection settings
+{:ok, _pid} = SelectoExamples.Repo.start_link(
+  database: "selecto_examples_dev",
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  pool_size: 5
+)
+
+repo = SelectoExamples.Repo
+IO.puts("Connected to database!")
+```
+
+## Domain Configurations
+
+Let's define the domain configurations we'll use throughout these examples:
+
+```elixir
+# Product Domain
+product_domain = %{
+  name: "Products",
+  source: %{
+    source_table: "products",
+    primary_key: :id,
+    fields: [:id, :name, :sku, :description, :price, :cost, :stock_quantity,
+             :reorder_level, :active, :featured, :tags, :category_id, :supplier_id,
+             :inserted_at, :updated_at],
+    columns: %{
+      id: %{type: :integer},
+      name: %{type: :string, label: "Product Name"},
+      sku: %{type: :string, label: "SKU"},
+      description: %{type: :text},
+      price: %{type: :decimal, label: "Price"},
+      cost: %{type: :decimal, label: "Cost"},
+      stock_quantity: %{type: :integer, label: "Stock"},
+      reorder_level: %{type: :integer},
+      active: %{type: :boolean, label: "Active?"},
+      featured: %{type: :boolean, label: "Featured?"},
+      tags: %{type: {:array, :string}},
+      category_id: %{type: :integer},
+      supplier_id: %{type: :integer},
+      inserted_at: %{type: :utc_datetime},
+      updated_at: %{type: :utc_datetime}
+    }
+  },
+  schemas: %{
+    categories: %{
+      source_table: "categories",
+      primary_key: :id,
+      fields: [:id, :name, :description, :slug, :active],
+      columns: %{
+        id: %{type: :integer},
+        name: %{type: :string},
+        description: %{type: :text},
+        slug: %{type: :string},
+        active: %{type: :boolean}
+      }
+    },
+    suppliers: %{
+      source_table: "suppliers",
+      primary_key: :id,
+      fields: [:id, :company_name, :contact_name, :email, :city, :country, :active],
+      columns: %{
+        id: %{type: :integer},
+        company_name: %{type: :string},
+        contact_name: %{type: :string},
+        email: %{type: :string},
+        city: %{type: :string},
+        country: %{type: :string},
+        active: %{type: :boolean}
+      }
+    }
+  },
+  joins: %{
+    category: %{
+      name: "Category",
+      type: :left,
+      source: "categories",
+      on: [%{left: "category_id", right: "id"}],
+      fields: %{
+        name: %{type: :string, label: "Category Name"},
+        description: %{type: :text}
+      }
+    },
+    supplier: %{
+      name: "Supplier",
+      type: :left,
+      source: "suppliers",
+      on: [%{left: "supplier_id", right: "id"}],
+      fields: %{
+        company_name: %{type: :string, label: "Supplier Name"},
+        contact_name: %{type: :string}
+      }
+    }
+  }
+}
+
+IO.puts("Product domain configured!")
+```
+
+```elixir
+# Order Domain
+order_domain = %{
+  name: "Orders",
+  source: %{
+    source_table: "orders",
+    primary_key: :id,
+    fields: [:id, :order_number, :status, :subtotal, :tax, :shipping, :discount,
+             :total, :shipping_city, :shipping_country, :customer_id,
+             :shipped_at, :delivered_at, :inserted_at, :updated_at],
+    columns: %{
+      id: %{type: :integer},
+      order_number: %{type: :string, label: "Order #"},
+      status: %{type: :string, label: "Status"},
+      subtotal: %{type: :decimal},
+      tax: %{type: :decimal},
+      shipping: %{type: :decimal},
+      discount: %{type: :decimal},
+      total: %{type: :decimal, label: "Total"},
+      shipping_city: %{type: :string},
+      shipping_country: %{type: :string},
+      customer_id: %{type: :integer},
+      shipped_at: %{type: :utc_datetime},
+      delivered_at: %{type: :utc_datetime},
+      inserted_at: %{type: :utc_datetime, label: "Order Date"},
+      updated_at: %{type: :utc_datetime}
+    }
+  },
+  schemas: %{
+    customers: %{
+      source_table: "customers",
+      primary_key: :id,
+      fields: [:id, :name, :email, :phone, :tier, :city, :country, :active],
+      columns: %{
+        id: %{type: :integer},
+        name: %{type: :string},
+        email: %{type: :string},
+        phone: %{type: :string},
+        tier: %{type: :string},
+        city: %{type: :string},
+        country: %{type: :string},
+        active: %{type: :boolean}
+      }
+    },
+    order_items: %{
+      source_table: "order_items",
+      primary_key: :id,
+      fields: [:id, :quantity, :unit_price, :discount, :line_total, :order_id, :product_id],
+      columns: %{
+        id: %{type: :integer},
+        quantity: %{type: :integer},
+        unit_price: %{type: :decimal},
+        discount: %{type: :decimal},
+        line_total: %{type: :decimal},
+        order_id: %{type: :integer},
+        product_id: %{type: :integer}
+      }
+    }
+  },
+  joins: %{
+    customer: %{
+      name: "Customer",
+      type: :left,
+      source: "customers",
+      on: [%{left: "customer_id", right: "id"}],
+      fields: %{
+        name: %{type: :string, label: "Customer Name"},
+        email: %{type: :string},
+        tier: %{type: :string, label: "Customer Tier"}
+      }
+    },
+    order_items: %{
+      name: "Order Items",
+      type: :left,
+      source: "order_items",
+      on: [%{left: "id", right: "order_id"}],
+      fields: %{
+        quantity: %{type: :integer},
+        unit_price: %{type: :decimal},
+        line_total: %{type: :decimal}
+      }
+    }
+  }
+}
+
+IO.puts("Order domain configured!")
+```
+
+```elixir
+# Customer Domain
+customer_domain = %{
+  name: "Customers",
+  source: %{
+    source_table: "customers",
+    primary_key: :id,
+    fields: [:id, :name, :email, :phone, :tier, :company_name, :city, :country,
+             :active, :verified_at, :inserted_at, :updated_at],
+    columns: %{
+      id: %{type: :integer},
+      name: %{type: :string, label: "Customer Name"},
+      email: %{type: :string},
+      phone: %{type: :string},
+      tier: %{type: :string, label: "Tier"},
+      company_name: %{type: :string},
+      city: %{type: :string},
+      country: %{type: :string},
+      active: %{type: :boolean},
+      verified_at: %{type: :utc_datetime},
+      inserted_at: %{type: :utc_datetime},
+      updated_at: %{type: :utc_datetime}
+    }
+  },
+  joins: %{}
+}
+
+IO.puts("Customer domain configured!")
+```
+
+```elixir
+# Employee Domain (for hierarchical examples)
+employee_domain = %{
+  name: "Employees",
+  source: %{
+    source_table: "employees",
+    primary_key: :id,
+    fields: [:id, :first_name, :last_name, :email, :title, :department,
+             :hire_date, :salary, :active, :manager_id, :inserted_at, :updated_at],
+    columns: %{
+      id: %{type: :integer},
+      first_name: %{type: :string},
+      last_name: %{type: :string},
+      email: %{type: :string},
+      title: %{type: :string},
+      department: %{type: :string},
+      hire_date: %{type: :date},
+      salary: %{type: :decimal},
+      active: %{type: :boolean},
+      manager_id: %{type: :integer},
+      inserted_at: %{type: :utc_datetime},
+      updated_at: %{type: :utc_datetime}
+    }
+  },
+  schemas: %{
+    employees: %{
+      source_table: "employees",
+      primary_key: :id,
+      fields: [:id, :first_name, :last_name, :email, :title, :department,
+               :hire_date, :salary, :active, :manager_id],
+      columns: %{
+        id: %{type: :integer},
+        first_name: %{type: :string},
+        last_name: %{type: :string},
+        email: %{type: :string},
+        title: %{type: :string},
+        department: %{type: :string},
+        hire_date: %{type: :date},
+        salary: %{type: :decimal},
+        active: %{type: :boolean},
+        manager_id: %{type: :integer}
+      }
+    }
+  },
+  joins: %{
+    manager: %{
+      name: "Manager",
+      type: :left,
+      source: "employees",
+      on: [%{left: "manager_id", right: "id"}],
+      fields: %{
+        first_name: %{type: :string, label: "Manager First Name"},
+        last_name: %{type: :string, label: "Manager Last Name"}
+      }
+    }
+  }
+}
+
+IO.puts("Employee domain configured!")
+```
+
+## Section 1: Basic Query Building
+
+### Selecting Fields
+
+```elixir
+# Simple field selection
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "sku", "price", "stock_quantity"])
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.puts("\nFirst 10 Products:")
+    Enum.each(rows, fn row ->
+      IO.puts("  #{inspect(row)}")
+    end)
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+### Select with Joins (dot notation)
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "price", "category.name", "supplier.company_name"])
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("Products with Category and Supplier:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row ->
+      IO.puts("  #{inspect(row)}")
+    end)
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## Section 2: Filtering Data
+
+### Simple Equality Filter
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "price", "active"])
+|> Selecto.filter({"active", true})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Active Products Only:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Comparison Operators
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "price", "stock_quantity"])
+|> Selecto.filter({"price", {:gt, 50}})      # price > 50
+|> Selecto.filter({"stock_quantity", {:gte, 100}})  # stock >= 100
+|> Selecto.order_by({"price", :desc})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Products with price > 50 and stock >= 100:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Pattern Matching with LIKE/ILIKE
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "sku", "price"])
+|> Selecto.filter({"name", {:ilike, "%wireless%"}})  # Case-insensitive
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Products with 'wireless' in name:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### IN Operator
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select(["order_number", "status", "total"])
+|> Selecto.filter({"status", {:in, ["pending", "processing"]}})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Pending and Processing Orders:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### BETWEEN Filter
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "price"])
+|> Selecto.filter({"price", {:between, 25, 75}})
+|> Selecto.order_by({"price", :asc})
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Products priced between $25 and $75:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### NULL Checks
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select(["order_number", "status", "shipped_at"])
+|> Selecto.filter({"shipped_at", :is_not_null})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Orders that have been shipped:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### OR Conditions
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select(["order_number", "status", "total"])
+|> Selecto.filter({:or, [
+  {"status", "pending"},
+  {"status", "cancelled"}
+]})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Pending OR Cancelled Orders:")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 3: Sorting and Pagination
+
+### Sorting Results
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "category.name", "price"])
+|> Selecto.order_by([
+  {"category.name", :asc},
+  {"price", :desc}
+])
+|> Selecto.limit(15)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Products sorted by Category (asc), then Price (desc):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Pagination
+
+```elixir
+# Page 2, 10 items per page
+page = 2
+per_page = 10
+
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select(["name", "sku", "price"])
+|> Selecto.order_by({"name", :asc})
+|> Selecto.limit(per_page)
+|> Selecto.offset((page - 1) * per_page)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Page #{page} (#{per_page} items per page):")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 4: Aggregates and Grouping
+
+### Simple Aggregates
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  {:count, "*"},
+  {:avg, "price"},
+  {:min, "price"},
+  {:max, "price"},
+  {:sum, "stock_quantity"}
+])
+|> Selecto.execute()
+
+case result do
+  {:ok, {[[count, avg, min, max, sum]], columns, _}} ->
+    IO.puts("Product Statistics:")
+    IO.puts("  Count: #{count}")
+    IO.puts("  Average Price: $#{Decimal.round(avg || Decimal.new(0), 2)}")
+    IO.puts("  Min Price: $#{min}")
+    IO.puts("  Max Price: $#{max}")
+    IO.puts("  Total Stock: #{sum}")
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Group By with Aggregates
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "category.name",
+  {:count, "*"},
+  {:avg, "price"},
+  {:sum, "stock_quantity"}
+])
+|> Selecto.group_by(["category.name"])
+|> Selecto.order_by({{:count, "*"}, :desc})
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Products by Category:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row ->
+      [cat, count, avg, stock] = row
+      IO.puts("  #{cat}: #{count} products, avg $#{Decimal.round(avg || Decimal.new(0), 2)}, #{stock} in stock")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Count Distinct
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  {:count, "*"},
+  {:count_distinct, "customer_id"},
+  {:sum, "total"},
+  {:avg, "total"}
+])
+|> Selecto.filter({"status", {:in, ["delivered", "shipped"]}})
+|> Selecto.execute()
+
+case result do
+  {:ok, {[[orders, customers, revenue, avg_order]], _, _}} ->
+    IO.puts("Sales Summary (Shipped/Delivered Orders):")
+    IO.puts("  Total Orders: #{orders}")
+    IO.puts("  Unique Customers: #{customers}")
+    IO.puts("  Total Revenue: $#{Decimal.round(revenue || Decimal.new(0), 2)}")
+    IO.puts("  Average Order Value: $#{Decimal.round(avg_order || Decimal.new(0), 2)}")
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 5: Joins and Associations
+
+### Basic Joins (automatic via dot notation)
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "order_number",
+  "status",
+  "total",
+  "customer.name",
+  "customer.tier"
+])
+|> Selecto.filter({"status", "delivered"})
+|> Selecto.order_by({"total", :desc})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Top 10 Delivered Orders with Customer Info:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Orders by Customer Tier
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "customer.tier",
+  {:count, "*"},
+  {:sum, "total"},
+  {:avg, "total"}
+])
+|> Selecto.group_by(["customer.tier"])
+|> Selecto.order_by({{:sum, "total"}, :desc})
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Order Summary by Customer Tier:")
+    Enum.each(rows, fn [tier, count, sum, avg] ->
+      IO.puts("  #{tier || "unknown"}: #{count} orders, $#{Decimal.round(sum || Decimal.new(0), 2)} total, $#{Decimal.round(avg || Decimal.new(0), 2)} avg")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 6: Employees with Manager (Self-Join)
+
+```elixir
+{:ok, selecto} = Selecto.configure(employee_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "first_name",
+  "last_name",
+  "title",
+  "department",
+  "manager.first_name",
+  "manager.last_name"
+])
+|> Selecto.order_by([{"department", :asc}, {"last_name", :asc}])
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, columns, _}} ->
+    IO.puts("Employees with their Managers:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [first, last, title, dept, mgr_first, mgr_last] ->
+      manager = if mgr_first, do: "#{mgr_first} #{mgr_last}", else: "(No Manager)"
+      IO.puts("  #{first} #{last} - #{title} (#{dept}) - Reports to: #{manager}")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 7: Advanced Queries
+
+### Sales by Status
+
+```elixir
+{:ok, selecto} = Selecto.configure(order_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "status",
+  {:count, "*"},
+  {:sum, "total"},
+  {:avg, "total"}
+])
+|> Selecto.group_by(["status"])
+|> Selecto.order_by({{:count, "*"}, :desc})
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Order Status Breakdown:")
+    Enum.each(rows, fn [status, count, sum, avg] ->
+      IO.puts("  #{status}: #{count} orders, $#{Decimal.round(sum || Decimal.new(0), 2)} total revenue")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Top Selling Products (via Order Items)
+
+```elixir
+# First, let's create a simple order_items domain
+order_items_domain = %{
+  name: "OrderItems",
+  source: %{
+    source_table: "order_items",
+    primary_key: :id,
+    fields: [:id, :quantity, :unit_price, :line_total, :order_id, :product_id],
+    columns: %{
+      id: %{type: :integer},
+      quantity: %{type: :integer},
+      unit_price: %{type: :decimal},
+      line_total: %{type: :decimal},
+      order_id: %{type: :integer},
+      product_id: %{type: :integer}
+    }
+  },
+  schemas: %{
+    products: %{
+      source_table: "products",
+      primary_key: :id,
+      fields: [:id, :name, :sku, :price],
+      columns: %{
+        id: %{type: :integer},
+        name: %{type: :string},
+        sku: %{type: :string},
+        price: %{type: :decimal}
+      }
+    }
+  },
+  joins: %{
+    product: %{
+      name: "Product",
+      type: :left,
+      source: "products",
+      on: [%{left: "product_id", right: "id"}],
+      fields: %{
+        name: %{type: :string},
+        sku: %{type: :string}
+      }
+    }
+  }
+}
+
+{:ok, selecto} = Selecto.configure(order_items_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "product.name",
+  "product.sku",
+  {:sum, "quantity"},
+  {:sum, "line_total"}
+])
+|> Selecto.group_by(["product.name", "product.sku"])
+|> Selecto.order_by({{:sum, "line_total"}, :desc})
+|> Selecto.limit(10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Top 10 Products by Revenue:")
+    Enum.each(rows, fn [name, sku, qty, revenue] ->
+      IO.puts("  #{name} (#{sku}): #{qty} units, $#{Decimal.round(revenue || Decimal.new(0), 2)} revenue")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Department Salary Summary
+
+```elixir
+{:ok, selecto} = Selecto.configure(employee_domain, repo)
+
+result = selecto
+|> Selecto.select([
+  "department",
+  {:count, "*"},
+  {:sum, "salary"},
+  {:avg, "salary"},
+  {:min, "salary"},
+  {:max, "salary"}
+])
+|> Selecto.filter({"active", true})
+|> Selecto.group_by(["department"])
+|> Selecto.order_by({{:sum, "salary"}, :desc})
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Salary Summary by Department:")
+    Enum.each(rows, fn [dept, count, sum, avg, min, max] ->
+      IO.puts("\n  #{dept}:")
+      IO.puts("    Employees: #{count}")
+      IO.puts("    Total Payroll: $#{Decimal.round(sum || Decimal.new(0), 2)}")
+      IO.puts("    Average Salary: $#{Decimal.round(avg || Decimal.new(0), 2)}")
+      IO.puts("    Range: $#{min} - $#{max}")
+    end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+## Section 8: Composable Query Patterns
+
+### Building Reusable Query Functions
+
+```elixir
+defmodule ProductQueries do
+  def base_query(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+    selecto
+  end
+
+  def active_only(selecto) do
+    selecto |> Selecto.filter({"active", true})
+  end
+
+  def in_stock(selecto) do
+    selecto |> Selecto.filter({"stock_quantity", {:gt, 0}})
+  end
+
+  def price_range(selecto, min, max) do
+    selecto |> Selecto.filter({"price", {:between, min, max}})
+  end
+
+  def paginated(selecto, page, per_page) do
+    selecto
+    |> Selecto.limit(per_page)
+    |> Selecto.offset((page - 1) * per_page)
+  end
+end
+
+# Use the composable functions
+result = ProductQueries.base_query(repo, product_domain)
+|> ProductQueries.active_only()
+|> ProductQueries.in_stock()
+|> ProductQueries.price_range(20, 100)
+|> Selecto.select(["name", "price", "stock_quantity", "category.name"])
+|> Selecto.order_by({"price", :asc})
+|> ProductQueries.paginated(1, 10)
+|> Selecto.execute()
+
+case result do
+  {:ok, {rows, _columns, _}} ->
+    IO.puts("Active, In-Stock Products ($20-$100):")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+  {:error, e} -> IO.puts("Error: #{inspect(e)}")
+end
+```
+
+### Dynamic Search Function
+
+```elixir
+defmodule ProductSearch do
+  def search(repo, domain, params \\ %{}) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    selecto
+    |> Selecto.select(["id", "name", "sku", "price", "stock_quantity", "category.name"])
+    |> apply_search(params[:q])
+    |> apply_category_filter(params[:category])
+    |> apply_price_filter(params[:min_price], params[:max_price])
+    |> apply_active_filter(params[:active])
+    |> apply_sorting(params[:sort], params[:direction])
+    |> Selecto.limit(params[:limit] || 25)
+    |> Selecto.execute()
+  end
+
+  defp apply_search(selecto, nil), do: selecto
+  defp apply_search(selecto, ""), do: selecto
+  defp apply_search(selecto, query) do
+    selecto |> Selecto.filter({"name", {:ilike, "%#{query}%"}})
+  end
+
+  defp apply_category_filter(selecto, nil), do: selecto
+  defp apply_category_filter(selecto, category) do
+    selecto |> Selecto.filter({"category.name", {:ilike, "%#{category}%"}})
+  end
+
+  defp apply_price_filter(selecto, nil, nil), do: selecto
+  defp apply_price_filter(selecto, min, nil) when not is_nil(min) do
+    selecto |> Selecto.filter({"price", {:gte, min}})
+  end
+  defp apply_price_filter(selecto, nil, max) when not is_nil(max) do
+    selecto |> Selecto.filter({"price", {:lte, max}})
+  end
+  defp apply_price_filter(selecto, min, max) do
+    selecto |> Selecto.filter({"price", {:between, min, max}})
+  end
+
+  defp apply_active_filter(selecto, nil), do: selecto
+  defp apply_active_filter(selecto, active) do
+    selecto |> Selecto.filter({"active", active})
+  end
+
+  defp apply_sorting(selecto, nil, _), do: selecto |> Selecto.order_by({"name", :asc})
+  defp apply_sorting(selecto, field, direction) do
+    dir = if direction == "desc", do: :desc, else: :asc
+    selecto |> Selecto.order_by({field, dir})
+  end
+end
+
+# Example searches
+IO.puts("\n--- Search: 'wireless' products ---")
+{:ok, {rows, _, _}} = ProductSearch.search(repo, product_domain, %{q: "wireless"})
+Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+
+IO.puts("\n--- Search: Electronics under $100 ---")
+{:ok, {rows, _, _}} = ProductSearch.search(repo, product_domain, %{
+  category: "electronics",
+  max_price: 100,
+  sort: "price",
+  direction: "asc"
+})
+Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+
+IO.puts("\n--- Search: Active products $30-$60 ---")
+{:ok, {rows, _, _}} = ProductSearch.search(repo, product_domain, %{
+  active: true,
+  min_price: 30,
+  max_price: 60,
+  limit: 10
+})
+Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+```
+
+## Section 9: Output Formats
+
+### Transform to Maps
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+{:ok, {rows, columns, aliases}} = selecto
+|> Selecto.select(["name", "sku", "price", "stock_quantity"])
+|> Selecto.filter({"featured", true})
+|> Selecto.execute()
+
+# Transform to maps
+maps = Enum.map(rows, fn row ->
+  Enum.zip(columns, row) |> Map.new()
+end)
+
+IO.puts("Featured Products as Maps:")
+Enum.each(maps, fn map ->
+  IO.puts("  #{map["name"]} (#{map["sku"]}): $#{map["price"]}, #{map["stock_quantity"]} in stock")
+end)
+```
+
+### Create a Summary Table with Kino
+
+```elixir
+{:ok, selecto} = Selecto.configure(product_domain, repo)
+
+{:ok, {rows, columns, _}} = selecto
+|> Selecto.select(["name", "sku", "price", "stock_quantity", "category.name"])
+|> Selecto.filter({"active", true})
+|> Selecto.order_by({"price", :desc})
+|> Selecto.limit(15)
+|> Selecto.execute()
+
+# Transform for Kino DataTable
+data = Enum.map(rows, fn row ->
+  Enum.zip(columns, row) |> Map.new()
+end)
+
+Kino.DataTable.new(data)
+```
+
+## Section 10: Sales Dashboard Example
+
+Let's create a comprehensive sales dashboard using multiple queries:
+
+```elixir
+defmodule SalesDashboard do
+  def generate(repo, order_domain, product_domain) do
+    IO.puts("=" |> String.duplicate(60))
+    IO.puts("           SALES DASHBOARD")
+    IO.puts("=" |> String.duplicate(60))
+
+    # Overall stats
+    IO.puts("\n## OVERALL STATISTICS")
+    show_overall_stats(repo, order_domain)
+
+    # Status breakdown
+    IO.puts("\n## ORDER STATUS BREAKDOWN")
+    show_status_breakdown(repo, order_domain)
+
+    # Customer tier analysis
+    IO.puts("\n## REVENUE BY CUSTOMER TIER")
+    show_tier_analysis(repo, order_domain)
+
+    # Top customers
+    IO.puts("\n## TOP 5 CUSTOMERS BY REVENUE")
+    show_top_customers(repo, order_domain)
+
+    # Product category performance
+    IO.puts("\n## PRODUCT CATEGORY SUMMARY")
+    show_category_summary(repo, product_domain)
+
+    IO.puts("\n" <> String.duplicate("=", 60))
+  end
+
+  defp show_overall_stats(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    {:ok, {[[orders, customers, revenue, avg]], _, _}} = selecto
+    |> Selecto.select([
+      {:count, "*"},
+      {:count_distinct, "customer_id"},
+      {:sum, "total"},
+      {:avg, "total"}
+    ])
+    |> Selecto.execute()
+
+    IO.puts("  Total Orders: #{orders}")
+    IO.puts("  Unique Customers: #{customers}")
+    IO.puts("  Total Revenue: $#{format_decimal(revenue)}")
+    IO.puts("  Average Order Value: $#{format_decimal(avg)}")
+  end
+
+  defp show_status_breakdown(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    {:ok, {rows, _, _}} = selecto
+    |> Selecto.select([
+      "status",
+      {:count, "*"},
+      {:sum, "total"}
+    ])
+    |> Selecto.group_by(["status"])
+    |> Selecto.order_by({{:count, "*"}, :desc})
+    |> Selecto.execute()
+
+    Enum.each(rows, fn [status, count, revenue] ->
+      IO.puts("  #{String.pad_trailing(status, 12)}: #{String.pad_leading(to_string(count), 4)} orders, $#{format_decimal(revenue)}")
+    end)
+  end
+
+  defp show_tier_analysis(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    {:ok, {rows, _, _}} = selecto
+    |> Selecto.select([
+      "customer.tier",
+      {:count, "*"},
+      {:sum, "total"},
+      {:avg, "total"}
+    ])
+    |> Selecto.group_by(["customer.tier"])
+    |> Selecto.order_by({{:sum, "total"}, :desc})
+    |> Selecto.execute()
+
+    Enum.each(rows, fn [tier, count, revenue, avg] ->
+      IO.puts("  #{String.pad_trailing(tier || "unknown", 10)}: #{count} orders, $#{format_decimal(revenue)} total, $#{format_decimal(avg)} avg")
+    end)
+  end
+
+  defp show_top_customers(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    {:ok, {rows, _, _}} = selecto
+    |> Selecto.select([
+      "customer.name",
+      "customer.tier",
+      {:count, "*"},
+      {:sum, "total"}
+    ])
+    |> Selecto.group_by(["customer.name", "customer.tier"])
+    |> Selecto.order_by({{:sum, "total"}, :desc})
+    |> Selecto.limit(5)
+    |> Selecto.execute()
+
+    Enum.with_index(rows, 1) |> Enum.each(fn {[name, tier, orders, revenue], rank} ->
+      IO.puts("  #{rank}. #{name} (#{tier}): #{orders} orders, $#{format_decimal(revenue)}")
+    end)
+  end
+
+  defp show_category_summary(repo, domain) do
+    {:ok, selecto} = Selecto.configure(domain, repo)
+
+    {:ok, {rows, _, _}} = selecto
+    |> Selecto.select([
+      "category.name",
+      {:count, "*"},
+      {:avg, "price"},
+      {:sum, "stock_quantity"}
+    ])
+    |> Selecto.group_by(["category.name"])
+    |> Selecto.order_by({{:count, "*"}, :desc})
+    |> Selecto.execute()
+
+    Enum.each(rows, fn [category, count, avg_price, stock] ->
+      IO.puts("  #{String.pad_trailing(category || "Unknown", 20)}: #{count} products, $#{format_decimal(avg_price)} avg, #{stock} units")
+    end)
+  end
+
+  defp format_decimal(nil), do: "0.00"
+  defp format_decimal(d) when is_struct(d, Decimal), do: Decimal.round(d, 2) |> Decimal.to_string()
+  defp format_decimal(n), do: :erlang.float_to_binary(n / 1, decimals: 2)
+end
+
+# Generate the dashboard
+SalesDashboard.generate(repo, order_domain, product_domain)
+```
+
+## Conclusion
+
+This Livebook has demonstrated the core features of Selecto:
+
+1. **Domain Configuration** - Defining your data model with sources, columns, and joins
+2. **Query Building** - Using the fluent API to build queries
+3. **Filtering** - Applying various filter conditions (equality, comparison, pattern matching, etc.)
+4. **Sorting & Pagination** - Ordering results and implementing pagination
+5. **Aggregates** - Using COUNT, SUM, AVG, MIN, MAX with GROUP BY
+6. **Joins** - Automatic joins via dot notation
+7. **Composable Patterns** - Building reusable query functions
+8. **Output Formats** - Transforming results for different use cases
+
+For more advanced features like CTEs, window functions, set operations, and JSON/array operations, refer to the complete [SELECTO_GUIDE.md](../../../selecto/SELECTO_GUIDE.md).
