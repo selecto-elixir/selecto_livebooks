@@ -27,7 +27,7 @@ defmodule SelectoExamples.Domains.EmployeeDomain do
           updated_at: %{type: :utc_datetime, label: "Updated At"}
         },
         associations: %{
-          manager: %{queryable: :employees, owner_key: :manager_id, related_key: :id}
+          manager: %{field: :manager, queryable: :employees, owner_key: :manager_id, related_key: :id}
         }
       },
       schemas: %{

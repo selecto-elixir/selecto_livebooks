@@ -33,8 +33,8 @@ defmodule SelectoExamples.Domains.ProductDomain do
           updated_at: %{type: :utc_datetime, label: "Updated At"}
         },
         associations: %{
-          category: %{queryable: :categories, owner_key: :category_id, related_key: :id},
-          supplier: %{queryable: :suppliers, owner_key: :supplier_id, related_key: :id}
+          category: %{field: :category, queryable: :categories, owner_key: :category_id, related_key: :id},
+          supplier: %{field: :supplier, queryable: :suppliers, owner_key: :supplier_id, related_key: :id}
         }
       },
       schemas: %{

@@ -72,8 +72,8 @@ product_domain = %{
       updated_at: %{type: :utc_datetime}
     },
     associations: %{
-      category: %{queryable: :categories, owner_key: :category_id, related_key: :id},
-      supplier: %{queryable: :suppliers, owner_key: :supplier_id, related_key: :id}
+      category: %{field: :category, queryable: :categories, owner_key: :category_id, related_key: :id},
+      supplier: %{field: :supplier, queryable: :suppliers, owner_key: :supplier_id, related_key: :id}
     }
   },
   schemas: %{
@@ -155,8 +155,8 @@ order_domain = %{
       updated_at: %{type: :utc_datetime}
     },
     associations: %{
-      customer: %{queryable: :customers, owner_key: :customer_id, related_key: :id},
-      order_items: %{queryable: :order_items, owner_key: :id, related_key: :order_id}
+      customer: %{field: :customer, queryable: :customers, owner_key: :customer_id, related_key: :id},
+      order_items: %{field: :order_items, queryable: :order_items, owner_key: :id, related_key: :order_id}
     }
   },
   schemas: %{
@@ -265,7 +265,7 @@ employee_domain = %{
       updated_at: %{type: :utc_datetime}
     },
     associations: %{
-      manager: %{queryable: :employees, owner_key: :manager_id, related_key: :id}
+      manager: %{field: :manager, queryable: :employees, owner_key: :manager_id, related_key: :id}
     }
   },
   schemas: %{
@@ -318,7 +318,7 @@ order_items_domain = %{
       product_id: %{type: :integer}
     },
     associations: %{
-      product: %{queryable: :products, owner_key: :product_id, related_key: :id}
+      product: %{field: :product, queryable: :products, owner_key: :product_id, related_key: :id}
     }
   },
   schemas: %{

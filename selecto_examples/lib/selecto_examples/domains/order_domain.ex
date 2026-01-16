@@ -36,8 +36,8 @@ defmodule SelectoExamples.Domains.OrderDomain do
           updated_at: %{type: :utc_datetime}
         },
         associations: %{
-          customer: %{queryable: :customers, owner_key: :customer_id, related_key: :id},
-          order_items: %{queryable: :order_items, owner_key: :id, related_key: :order_id}
+          customer: %{field: :customer, queryable: :customers, owner_key: :customer_id, related_key: :id},
+          order_items: %{field: :order_items, queryable: :order_items, owner_key: :id, related_key: :order_id}
         }
       },
       schemas: %{
