@@ -396,17 +396,17 @@ defmodule SeedHelpers do
     total = Enum.sum(weights)
     r = :rand.uniform(total)
 
-    {_, _, item} = Enum.zip([items, weights])
-    |> Enum.reduce({0, r, nil}, fn {item, weight}, {acc, remaining, _selected} ->
+    {_, _, item} = Enum.zip(items, weights)
+    |> Enum.reduce({0, r, nil}, fn {item, weight}, {acc, remaining, selected} ->
       new_acc = acc + weight
-      if remaining <= new_acc and remaining > acc do
+      if selected == nil and remaining <= new_acc do
         {new_acc, remaining, item}
       else
-        {new_acc, remaining, nil}
+        {new_acc, remaining, selected}
       end
     end)
 
-    item || List.last(items)
+    item || List.first(items)
   end
 end
 
@@ -418,13 +418,17 @@ orders_data = for i <- 1..200 do
   status = SeedHelpers.weighted_random(statuses, status_weights)
 
   shipped_at = if status in ["shipped", "delivered"] do
-    DateTime.add(DateTime.utc_now(), (-days_ago + :rand.uniform(3)) * 24 * 60 * 60, :second)
+    DateTime.utc_now()
+    |> DateTime.add((-days_ago + :rand.uniform(3)) * 24 * 60 * 60, :second)
+    |> DateTime.truncate(:second)
   else
     nil
   end
 
   delivered_at = if status == "delivered" do
-    DateTime.add(shipped_at || DateTime.utc_now(), :rand.uniform(5) * 24 * 60 * 60, :second)
+    (shipped_at || DateTime.utc_now())
+    |> DateTime.add(:rand.uniform(5) * 24 * 60 * 60, :second)
+    |> DateTime.truncate(:second)
   else
     nil
   end
