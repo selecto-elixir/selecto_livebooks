@@ -1165,6 +1165,120 @@ end
 SalesDashboard.generate(config)
 ```
 
+## Section 11: Set Operations (UNION / INTERSECT / EXCEPT)
+
+Set operations combine compatible result sets. Each query must project the same columns (count and compatible types).
+
+```elixir
+first_batch =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status"])
+  |> Selecto.limit(5)
+
+next_batch =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status"])
+  |> Selecto.limit(5)
+  |> Selecto.offset(5)
+
+set_queries = [
+  {"UNION", Selecto.union(first_batch, next_batch)},
+  {"UNION ALL", Selecto.union(first_batch, next_batch, all: true)},
+  {"INTERSECT", Selecto.intersect(first_batch, next_batch)},
+  {"EXCEPT", Selecto.except(first_batch, next_batch)}
+]
+
+Enum.each(set_queries, fn {label, query} ->
+  IO.puts("\n=== #{label} ===")
+
+  {sql, params} = Selecto.to_sql(query)
+  IO.puts(sql)
+  IO.puts("Params: #{inspect(params)}")
+
+  case Selecto.execute(query) do
+    {:ok, {rows, columns, _aliases}} ->
+      IO.puts("Columns: #{inspect(columns)}")
+      IO.puts("Row count: #{length(rows)}")
+      Enum.each(Enum.take(rows, 5), fn row ->
+        IO.puts("  #{inspect(row)}")
+      end)
+
+    {:error, error} ->
+      IO.puts("Execution error: #{inspect(error)}")
+  end
+end)
+```
+
+## Section 12: CTEs (WITH and WITH RECURSIVE)
+
+### Non-Recursive CTE
+
+```elixir
+cte_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.filter({"total", {:gt, 500}})
+  end)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"total", {:gt, 500}})
+  |> Selecto.limit(5)
+
+{cte_sql, cte_params} = Selecto.to_sql(cte_query)
+IO.puts("Generated SQL with WITH clause:\n")
+IO.puts(cte_sql)
+IO.puts("\nParams: #{inspect(cte_params)}")
+
+case Selecto.execute(cte_query) do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nHigh-value orders:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+### Recursive CTE
+
+```elixir
+base_query = fn ->
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
+  |> Selecto.filter({"manager_id", nil})
+end
+
+recursive_query = fn _cte_ref ->
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
+  |> Selecto.filter({"manager_id", :not_null})
+  |> Selecto.limit(5)
+end
+
+recursive_cte_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_recursive_cte("employee_tree_demo", base_query, recursive_query)
+  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
+  |> Selecto.limit(5)
+
+{recursive_sql, recursive_params} = Selecto.to_sql(recursive_cte_query)
+IO.puts("Generated SQL with WITH RECURSIVE:\n")
+IO.puts(recursive_sql)
+IO.puts("\nParams: #{inspect(recursive_params)}")
+
+case Selecto.execute(recursive_cte_query) do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nSample recursive CTE result rows:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -1177,5 +1291,10 @@ This Livebook has demonstrated the core features of Selecto:
 6. **Joins** - Automatic joins via dot notation
 7. **Composable Patterns** - Building reusable query functions
 8. **Output Formats** - Transforming results for different use cases
+9. **Set Operations** - Combining results with UNION / INTERSECT / EXCEPT
+10. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
 
-For more advanced features like CTEs, window functions, set operations, and JSON/array operations, refer to the complete [SELECTO_GUIDE.md](../../../../selecto/SELECTO_GUIDE.md).
+For more advanced features, see:
+- [Advanced Usage](../../../../selecto/guides/advanced_usage.md)
+- [SQL Functions](../../../../selecto/guides/sql_functions.md)
+- [Complex Join Patterns](../../../../selecto/guides/complex_join_patterns.md)
