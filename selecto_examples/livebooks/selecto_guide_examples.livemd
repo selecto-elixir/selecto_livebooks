@@ -1218,11 +1218,21 @@ cte_query =
   Selecto.configure(config.order_domain, config.repo)
   |> Selecto.with_cte("high_value_orders", fn ->
     Selecto.configure(config.order_domain, config.repo)
-    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.select(["id", "order_number", "status", "total"])
     |> Selecto.filter({"total", {:gt, 500}})
   end)
-  |> Selecto.select(["order_number", "status", "total"])
-  |> Selecto.filter({"total", {:gt, 500}})
+  |> Selecto.join(:high_value_orders,
+    source: "high_value_orders",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{
+      order_number: %{type: :string},
+      status: %{type: :string},
+      total: %{type: :decimal}
+    }
+  )
+  |> Selecto.select(["high_value_orders.order_number", "high_value_orders.status", "high_value_orders.total"])
   |> Selecto.limit(5)
 
 {cte_sql, cte_params} = Selecto.to_sql(cte_query)
@@ -1295,6 +1305,7 @@ This Livebook has demonstrated the core features of Selecto:
 10. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
 
 For more advanced features, see:
-- [Advanced Usage](../../../../selecto/guides/advanced_usage.md)
-- [SQL Functions](../../../../selecto/guides/sql_functions.md)
-- [Complex Join Patterns](../../../../selecto/guides/complex_join_patterns.md)
+
+* [Advanced Usage](../../../../selecto/guides/advanced_usage.md)
+* [SQL Functions](../../../../selecto/guides/sql_functions.md)
+* [Complex Join Patterns](../../../../selecto/guides/complex_join_patterns.md)
