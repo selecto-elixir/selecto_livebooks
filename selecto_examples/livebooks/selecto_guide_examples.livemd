@@ -371,6 +371,45 @@ IO.puts("\nAvailable: config.repo, config.product_domain, config.order_domain, e
 config
 ```
 
+```elixir
+defmodule SelectoExamples.LivebookHelpers do
+  @moduledoc false
+
+  def execute_with_checks(query, opts \\ []) do
+    label = Keyword.get(opts, :example, "Query")
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n[Checks] #{label}")
+    print_check("SQL generated", String.trim(sql) != "")
+    print_check("FROM clause present", valid_from_clause?(sql))
+    print_check("params available", is_list(params))
+    print_check("CTE appears consumed (if present)", cte_consumed?(sql))
+
+    Selecto.execute(query)
+  end
+
+  defp valid_from_clause?(sql) do
+    has_from = Regex.match?(~r/\bfrom\s+\S/m, sql)
+    bad_from = Regex.match?(~r/\bfrom\s*(\n|\r\n)\s*where\b/mi, sql)
+    has_from and not bad_from
+  end
+
+  defp cte_consumed?(sql) do
+    case Regex.run(~r/\bWITH(?:\s+RECURSIVE)?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\b/m, sql) do
+      nil ->
+        true
+
+      [_, cte_name] ->
+        count = Regex.scan(~r/\b#{Regex.escape(cte_name)}\b/, sql) |> length()
+        count > 1
+    end
+  end
+
+  defp print_check(name, true), do: IO.puts("  [PASS] #{name}")
+  defp print_check(name, false), do: IO.puts("  [FAIL] #{name}")
+end
+```
+
 ## Section 1: Basic Query Building
 
 ### Selecting Fields
@@ -382,7 +421,7 @@ selecto = Selecto.configure(config.product_domain, config.repo)
 result = selecto
 |> Selecto.select(["name", "sku", "price", "stock_quantity"])
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _aliases}} ->
@@ -404,7 +443,7 @@ selecto = Selecto.configure(config.product_domain, config.repo)
 result = selecto
 |> Selecto.select(["name", "price", "category.name", "supplier.company_name"])
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _aliases}} ->
@@ -429,7 +468,7 @@ result = selecto
 |> Selecto.select(["name", "price", "active"])
 |> Selecto.filter({"active", true})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -450,7 +489,7 @@ result = selecto
 |> Selecto.filter({"stock_quantity", {:gte, 100}})  # stock >= 100
 |> Selecto.order_by({"price", :desc})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -468,7 +507,7 @@ selecto = Selecto.configure(config.product_domain, config.repo)
 result = selecto
 |> Selecto.select(["name", "sku", "price"])
 |> Selecto.filter({"name", {:ilike, "%wireless%"}})  # Case-insensitive
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -487,7 +526,7 @@ result = selecto
 |> Selecto.select(["order_number", "status", "total"])
 |> Selecto.filter({"status", {:in, ["pending", "processing"]}})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -506,7 +545,7 @@ result = selecto
 |> Selecto.select(["name", "price"])
 |> Selecto.filter({"price", {:between, 25, 75}})
 |> Selecto.order_by({"price", :asc})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -525,7 +564,7 @@ result = selecto
 |> Selecto.select(["order_number", "status", "shipped_at"])
 |> Selecto.filter({"shipped_at", :not_null})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -547,7 +586,7 @@ result = selecto
   {"status", "cancelled"}
 ]})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -571,7 +610,7 @@ result = selecto
   {"price", :desc}
 ])
 |> Selecto.limit(15)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -596,7 +635,7 @@ result = selecto
 |> Selecto.order_by({"name", :asc})
 |> Selecto.limit(per_page)
 |> Selecto.offset((page - 1) * per_page)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -621,7 +660,7 @@ result = selecto
   {:max, "price"},
   {:sum, "stock_quantity"}
 ])
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {[[count, avg, min, max, sum]], columns, _}} ->
@@ -649,7 +688,7 @@ result = selecto
 ])
 |> Selecto.group_by(["category.name"])
 |> Selecto.order_by({{:count, "*"}, :desc})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -676,7 +715,7 @@ result = selecto
   {:avg, "total"}
 ])
 |> Selecto.filter({"status", {:in, ["delivered", "shipped"]}})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {[[orders, customers, revenue, avg_order]], _, _}} ->
@@ -707,7 +746,7 @@ result = selecto
 |> Selecto.filter({"status", "delivered"})
 |> Selecto.order_by({"total", :desc})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -732,7 +771,7 @@ result = selecto
 ])
 |> Selecto.group_by(["customer.tier"])
 |> Selecto.order_by({{:sum, "total"}, :desc})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -759,7 +798,7 @@ result = selecto
   "manager.last_name"
 ])
 |> Selecto.order_by([{"department", :asc}, {"last_name", :asc}])
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, columns, _}} ->
@@ -789,7 +828,7 @@ result = selecto
 ])
 |> Selecto.group_by(["status"])
 |> Selecto.order_by({{:count, "*"}, :desc})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -816,7 +855,7 @@ result = selecto
 |> Selecto.group_by(["product.name", "product.sku"])
 |> Selecto.order_by({{:sum, "line_total"}, :desc})
 |> Selecto.limit(10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -845,7 +884,7 @@ result = selecto
 |> Selecto.filter({"active", true})
 |> Selecto.group_by(["department"])
 |> Selecto.order_by({{:sum, "salary"}, :desc})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -899,7 +938,7 @@ result = ProductQueries.base_query(config.repo, config.product_domain)
 |> Selecto.select(["name", "price", "stock_quantity", "category.name"])
 |> Selecto.order_by({"price", :asc})
 |> ProductQueries.paginated(1, 10)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 case result do
   {:ok, {rows, _columns, _}} ->
@@ -924,7 +963,7 @@ defmodule ProductSearch do
     |> apply_active_filter(params[:active])
     |> apply_sorting(params[:sort], params[:direction])
     |> Selecto.limit(params[:limit] || 25)
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
   end
 
   defp apply_search(selecto, nil), do: selecto
@@ -995,7 +1034,7 @@ selecto = Selecto.configure(config.product_domain, config.repo)
 {:ok, {rows, columns, aliases}} = selecto
 |> Selecto.select(["name", "sku", "price", "stock_quantity"])
 |> Selecto.filter({"featured", true})
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 # Transform to maps
 maps = Enum.map(rows, fn row ->
@@ -1013,16 +1052,22 @@ end)
 ```elixir
 selecto = Selecto.configure(config.product_domain, config.repo)
 
-{:ok, {rows, columns, _}} = selecto
-|> Selecto.select(["name", "sku", "price", "stock_quantity", "category.name"])
+{:ok, {rows, _columns, aliases}} = selecto
+|> Selecto.select([
+  {:field, "name", "product_name"},
+  {:field, "sku", "sku"},
+  {:field, "price", "price"},
+  {:field, "stock_quantity", "stock_quantity"},
+  {:field, "category.name", "category_name"}
+])
 |> Selecto.filter({"active", true})
 |> Selecto.order_by({"price", :desc})
 |> Selecto.limit(15)
-|> Selecto.execute()
+|> SelectoExamples.LivebookHelpers.execute_with_checks()
 
 # Transform for Kino DataTable
 data = Enum.map(rows, fn row ->
-  Enum.zip(columns, row) |> Map.new()
+  Enum.zip(aliases, row) |> Map.new()
 end)
 
 Kino.DataTable.new(data)
@@ -1072,7 +1117,7 @@ defmodule SalesDashboard do
       {:sum, "total"},
       {:avg, "total"}
     ])
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
 
     IO.puts("  Total Orders: #{orders}")
     IO.puts("  Unique Customers: #{customers}")
@@ -1091,7 +1136,7 @@ defmodule SalesDashboard do
     ])
     |> Selecto.group_by(["status"])
     |> Selecto.order_by({{:count, "*"}, :desc})
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
 
     Enum.each(rows, fn [status, count, revenue] ->
       IO.puts("  #{String.pad_trailing(status, 12)}: #{String.pad_leading(to_string(count), 4)} orders, $#{format_decimal(revenue)}")
@@ -1110,7 +1155,7 @@ defmodule SalesDashboard do
     ])
     |> Selecto.group_by(["customer.tier"])
     |> Selecto.order_by({{:sum, "total"}, :desc})
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
 
     Enum.each(rows, fn [tier, count, revenue, avg] ->
       IO.puts("  #{String.pad_trailing(tier || "unknown", 10)}: #{count} orders, $#{format_decimal(revenue)} total, $#{format_decimal(avg)} avg")
@@ -1130,7 +1175,7 @@ defmodule SalesDashboard do
     |> Selecto.group_by(["customer.name", "customer.tier"])
     |> Selecto.order_by({{:sum, "total"}, :desc})
     |> Selecto.limit(5)
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
 
     Enum.with_index(rows, 1) |> Enum.each(fn {[name, tier, orders, revenue], rank} ->
       IO.puts("  #{rank}. #{name} (#{tier}): #{orders} orders, $#{format_decimal(revenue)}")
@@ -1149,7 +1194,7 @@ defmodule SalesDashboard do
     ])
     |> Selecto.group_by(["category.name"])
     |> Selecto.order_by({{:count, "*"}, :desc})
-    |> Selecto.execute()
+    |> SelectoExamples.LivebookHelpers.execute_with_checks()
 
     Enum.each(rows, fn [category, count, avg_price, stock] ->
       IO.puts("  #{String.pad_trailing(category || "Unknown", 20)}: #{count} products, $#{format_decimal(avg_price)} avg, #{stock} units")
@@ -1167,40 +1212,83 @@ SalesDashboard.generate(config)
 
 ## Section 11: Set Operations (UNION / INTERSECT / EXCEPT)
 
-Set operations combine compatible result sets. Each query must project the same columns (count and compatible types).
+Set operations are most useful when comparing meaningful cohorts.
+In this example we compare two employee cohorts:
+
+* Cohort A: employees who report to someone (`manager_id IS NOT NULL`)
+* Cohort B: employees who manage at least one direct report
+
+Each query projects the same columns so they are compatible for set operations.
 
 ```elixir
-first_batch =
-  Selecto.configure(config.order_domain, config.repo)
-  |> Selecto.select(["order_number", "status"])
-  |> Selecto.limit(5)
+employees_with_manager =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+  |> Selecto.filter({"manager_id", :not_null})
 
-next_batch =
-  Selecto.configure(config.order_domain, config.repo)
-  |> Selecto.select(["order_number", "status"])
-  |> Selecto.limit(5)
-  |> Selecto.offset(5)
+employees_with_direct_reports =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.join(:direct_report,
+    source: "employees",
+    type: :inner,
+    owner_key: :id,
+    related_key: :manager_id,
+    fields: %{
+      id: %{type: :integer}
+    }
+  )
+  |> Selecto.filter({"direct_report.id", :not_null})
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+  |> Selecto.group_by(["id", "first_name", "last_name", "title"])
 
 set_queries = [
-  {"UNION", Selecto.union(first_batch, next_batch)},
-  {"UNION ALL", Selecto.union(first_batch, next_batch, all: true)},
-  {"INTERSECT", Selecto.intersect(first_batch, next_batch)},
-  {"EXCEPT", Selecto.except(first_batch, next_batch)}
+  {
+    "UNION",
+    "All employees who either have a manager or manage someone.",
+    Selecto.union(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "UNION ALL",
+    "Same as UNION but keeps duplicates (middle managers appear twice).",
+    Selecto.union(employees_with_manager, employees_with_direct_reports, all: true)
+  },
+  {
+    "INTERSECT",
+    "Employees in both cohorts (middle managers: report to someone and manage others).",
+    Selecto.intersect(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "EXCEPT (A - B)",
+    "Employees who report to someone but do NOT manage others (individual contributors).",
+    Selecto.except(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "EXCEPT (B - A)",
+    "Employees who manage others but do NOT report to anyone (top-level leadership).",
+    Selecto.except(employees_with_direct_reports, employees_with_manager)
+  }
 ]
 
-Enum.each(set_queries, fn {label, query} ->
+Enum.each(set_queries, fn {label, meaning, query} ->
   IO.puts("\n=== #{label} ===")
+  IO.puts("Meaning: #{meaning}")
 
   {sql, params} = Selecto.to_sql(query)
   IO.puts(sql)
   IO.puts("Params: #{inspect(params)}")
 
-  case Selecto.execute(query) do
+  case SelectoExamples.LivebookHelpers.execute_with_checks(query) do
     {:ok, {rows, columns, _aliases}} ->
       IO.puts("Columns: #{inspect(columns)}")
       IO.puts("Row count: #{length(rows)}")
-      Enum.each(Enum.take(rows, 5), fn row ->
-        IO.puts("  #{inspect(row)}")
+      Enum.each(Enum.take(rows, 10), fn row ->
+        case row do
+          [id, first_name, last_name, title] ->
+            IO.puts("  ##{id} #{first_name} #{last_name} (#{title})")
+
+          _ ->
+            IO.puts("  #{inspect(row)}")
+        end
       end)
 
     {:error, error} ->
@@ -1213,81 +1301,214 @@ end)
 
 ### Non-Recursive CTE
 
+Business question: Which managers have the largest direct teams, and what is each team's total salary?
+
+Equivalent plain SQL (for intuition):
+
+```sql
+WITH manager_team_metrics AS (
+  SELECT manager_id, COUNT(*) AS direct_report_count, SUM(salary) AS team_salary_total
+  FROM employees
+  WHERE manager_id IS NOT NULL
+  GROUP BY manager_id
+)
+SELECT e.first_name, e.last_name, e.title,
+       m.direct_report_count, m.team_salary_total
+FROM employees e
+JOIN manager_team_metrics m ON m.manager_id = e.id
+WHERE m.direct_report_count >= 2
+ORDER BY m.direct_report_count DESC
+LIMIT 10;
+```
+
 ```elixir
 cte_query =
-  Selecto.configure(config.order_domain, config.repo)
-  |> Selecto.with_cte("high_value_orders", fn ->
-    Selecto.configure(config.order_domain, config.repo)
-    |> Selecto.select(["id", "order_number", "status", "total"])
-    |> Selecto.filter({"total", {:gt, 500}})
-  end)
-  |> Selecto.join(:high_value_orders,
-    source: "high_value_orders",
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_cte("manager_team_metrics", fn ->
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.select([
+      "manager_id",
+      {:count, "*"},
+      {:sum, "salary"}
+    ])
+    |> Selecto.filter({"manager_id", :not_null})
+    |> Selecto.group_by(["manager_id"])
+  end, columns: ["manager_id", "direct_report_count", "team_salary_total"])
+  |> Selecto.join(:manager_team_metrics,
+    source: "manager_team_metrics",
     type: :inner,
     owner_key: :id,
-    related_key: :id,
+    related_key: :manager_id,
     fields: %{
-      order_number: %{type: :string},
-      status: %{type: :string},
-      total: %{type: :decimal}
+      manager_id: %{type: :integer},
+      direct_report_count: %{type: :integer},
+      team_salary_total: %{type: :decimal}
     }
   )
-  |> Selecto.select(["high_value_orders.order_number", "high_value_orders.status", "high_value_orders.total"])
-  |> Selecto.limit(5)
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "title",
+    "manager_team_metrics.direct_report_count",
+    "manager_team_metrics.team_salary_total"
+  ])
+  |> Selecto.filter({"manager_team_metrics.direct_report_count", {:>=, 2}})
+  |> Selecto.order_by({"manager_team_metrics.direct_report_count", :desc})
+  |> Selecto.limit(10)
 
 {cte_sql, cte_params} = Selecto.to_sql(cte_query)
 IO.puts("Generated SQL with WITH clause:\n")
 IO.puts(cte_sql)
 IO.puts("\nParams: #{inspect(cte_params)}")
 
-case Selecto.execute(cte_query) do
+case SelectoExamples.LivebookHelpers.execute_with_checks(cte_query) do
   {:ok, {rows, columns, _aliases}} ->
-    IO.puts("\nHigh-value orders:")
+    IO.puts("\nManager Team Metrics (from non-recursive CTE):")
     IO.puts("Columns: #{inspect(columns)}")
-    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+    Enum.each(rows, fn [mgr_first, mgr_last, title, report_count, team_salary_total] ->
+      IO.puts(
+        "  #{mgr_first} #{mgr_last} (#{title}) -> " <>
+          "#{report_count} direct reports, total team salary $#{Decimal.round(team_salary_total || Decimal.new(0), 2)}"
+      )
+    end)
 
   {:error, error} ->
     IO.puts("Execution error: #{inspect(error)}")
 end
 ```
 
+Expected output checks (Non-Recursive CTE):
+
+* SQL includes `WITH manager_team_metrics AS ( ... )`
+* SQL CTE body includes `count(*)` and `sum(salary)` grouped by `manager_id`
+* SQL `FROM` is not empty
+* SQL references `manager_team_metrics` in the main query (not only in the CTE definition)
+* Params should include the team-size threshold (for this sample: `[2]`)
+* Rows should read as manager + direct report count + team salary
+
 ### Recursive CTE
+
+Business question: Starting from the VP of Sales, show every person in that reporting tree and their depth.
+
+Equivalent plain SQL (for intuition):
+
+```sql
+WITH RECURSIVE employee_tree_sales (id, first_name, last_name, manager_id, depth) AS (
+  SELECT id, first_name, last_name, manager_id, 0
+  FROM employees
+  WHERE email = 'sarah.connor@company.com'
+  UNION ALL
+  SELECT e.id, e.first_name, e.last_name, e.manager_id, t.depth + 1
+  FROM employees e
+  JOIN employee_tree_sales t ON e.manager_id = t.id
+)
+SELECT t.depth, t.first_name, t.last_name, t.title, m.first_name, m.last_name
+FROM employees e
+JOIN employee_tree_sales t ON t.id = e.id
+LEFT JOIN employees m ON m.id = e.manager_id
+ORDER BY t.depth, t.last_name
+LIMIT 15;
+```
 
 ```elixir
 base_query = fn ->
   Selecto.configure(config.employee_domain, config.repo)
-  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
-  |> Selecto.filter({"manager_id", nil})
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_id",
+    {:literal, 0}
+  ])
+  |> Selecto.filter({"email", "sarah.connor@company.com"})
 end
 
 recursive_query = fn _cte_ref ->
   Selecto.configure(config.employee_domain, config.repo)
-  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
-  |> Selecto.filter({"manager_id", :not_null})
-  |> Selecto.limit(5)
+  |> Selecto.join(:employee_tree_sales,
+    source: "employee_tree_sales",
+    type: :inner,
+    owner_key: :manager_id,
+    related_key: :id,
+    fields: %{
+      id: %{type: :integer},
+      first_name: %{type: :string},
+      last_name: %{type: :string},
+      manager_id: %{type: :integer},
+      depth: %{type: :integer}
+    }
+  )
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_id",
+    {:raw_sql, "employee_tree_sales.depth + 1"}
+  ])
+  # Required to make recursive expansion depend on prior CTE rows.
+  |> Selecto.filter({"employee_tree_sales.id", :not_null})
 end
 
 recursive_cte_query =
   Selecto.configure(config.employee_domain, config.repo)
-  |> Selecto.with_recursive_cte("employee_tree_demo", base_query, recursive_query)
-  |> Selecto.select(["id", "first_name", "last_name", "manager_id"])
-  |> Selecto.limit(5)
+  |> Selecto.with_recursive_cte("employee_tree_sales",
+    base_query: base_query,
+    recursive_query: recursive_query,
+    columns: ["id", "first_name", "last_name", "manager_id", "depth"]
+  )
+  |> Selecto.join(:employee_tree_sales,
+    source: "employee_tree_sales",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{
+      id: %{type: :integer},
+      first_name: %{type: :string},
+      last_name: %{type: :string},
+      manager_id: %{type: :integer},
+      depth: %{type: :integer}
+    }
+  )
+  |> Selecto.select([
+    "employee_tree_sales.depth",
+    "employee_tree_sales.first_name",
+    "employee_tree_sales.last_name",
+    "title",
+    "manager.first_name",
+    "manager.last_name"
+  ])
+  |> Selecto.order_by({"employee_tree_sales.depth", :asc})
+  |> Selecto.order_by({"employee_tree_sales.last_name", :asc})
+  |> Selecto.limit(15)
 
 {recursive_sql, recursive_params} = Selecto.to_sql(recursive_cte_query)
 IO.puts("Generated SQL with WITH RECURSIVE:\n")
 IO.puts(recursive_sql)
 IO.puts("\nParams: #{inspect(recursive_params)}")
 
-case Selecto.execute(recursive_cte_query) do
+case SelectoExamples.LivebookHelpers.execute_with_checks(recursive_cte_query) do
   {:ok, {rows, columns, _aliases}} ->
-    IO.puts("\nSample recursive CTE result rows:")
+    IO.puts("\nSales Reporting Tree (recursive CTE):")
     IO.puts("Columns: #{inspect(columns)}")
-    Enum.each(rows, fn row -> IO.puts("  #{inspect(row)}") end)
+    Enum.each(rows, fn [depth, emp_first, emp_last, title, mgr_first, mgr_last] ->
+      manager_name = if mgr_first, do: "#{mgr_first} #{mgr_last}", else: "(No Manager)"
+      IO.puts("  depth=#{depth} | #{emp_first} #{emp_last} (#{title}) -> Manager: #{manager_name}")
+    end)
 
   {:error, error} ->
     IO.puts("Execution error: #{inspect(error)}")
 end
 ```
+
+Expected output checks (Recursive CTE):
+
+* SQL starts with `WITH RECURSIVE employee_tree_sales AS (`
+* Recursive branch references the CTE via join:
+  `join employee_tree_sales ... on ...manager_id = ...id`
+* Main query selects from/joins `employee_tree_sales` (not just plain `from employees`)
+* SQL `FROM` is not empty
+* Params should include the anchor email (for this sample: `["sarah.connor@company.com"]`)
+* Output should show `depth=0` for Sarah Connor, then higher depths for her reports
 
 ## Conclusion
 
