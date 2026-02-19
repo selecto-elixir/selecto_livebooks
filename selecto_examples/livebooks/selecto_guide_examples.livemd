@@ -52,7 +52,7 @@ product_domain = %{
     source_table: "products",
     primary_key: :id,
     fields: [:id, :name, :sku, :description, :price, :cost, :stock_quantity,
-             :reorder_level, :active, :featured, :tags, :category_id, :supplier_id,
+             :reorder_level, :active, :featured, :tags, :metadata, :category_id, :supplier_id,
              :inserted_at, :updated_at],
     columns: %{
       id: %{type: :integer},
@@ -66,6 +66,7 @@ product_domain = %{
       active: %{type: :boolean, label: "Active?"},
       featured: %{type: :boolean, label: "Featured?"},
       tags: %{type: {:array, :string}},
+      metadata: %{type: :jsonb, label: "Metadata"},
       category_id: %{type: :integer},
       supplier_id: %{type: :integer},
       inserted_at: %{type: :utc_datetime},
@@ -1583,6 +1584,140 @@ Expected output checks (Recursive CTE):
 * Params should include the anchor email (for this sample: `["sarah.connor@company.com"]`)
 * Output should show `depth=0` for Sarah Connor, then higher depths for her reports
 
+## Section 13: Window Functions
+
+### Rank Employees Within Their Department
+
+Business question: Within each department, who are the top earners and what is the department average salary next to each row?
+
+```elixir
+window_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:row_number, [],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "department_salary_rank"
+  )
+  |> Selecto.window_function(:avg, ["salary"],
+    over: [partition_by: ["department"]],
+    as: "department_avg_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(15)
+
+{window_sql, window_params} = Selecto.to_sql(window_query)
+IO.puts("Generated SQL with window functions:\n")
+IO.puts(window_sql)
+IO.puts("\nParams: #{inspect(window_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(window_query) do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nDepartment Salary Ranking:")
+    IO.puts("Columns: #{inspect(columns)}")
+
+    Enum.each(rows, fn [first, last, dept, salary, rank, dept_avg] ->
+      IO.puts(
+        "  #{dept} | ##{rank} #{first} #{last} - " <>
+          "salary=$#{Decimal.round(salary || Decimal.new(0), 2)} " <>
+          "(dept avg=$#{Decimal.round(dept_avg || Decimal.new(0), 2)})"
+      )
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Window Functions):
+
+* SQL includes `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC)` for ranking
+* SQL includes `AVG(salary) OVER (PARTITION BY department)` for per-department average
+* Rank resets to `1` for the top salary in each department
+
+## Section 14: JSON Operations
+
+### Filter and Project Product Metadata (JSONB)
+
+Business question: Which active products are in the premium metadata band, and what JSON metadata values drive that classification?
+
+```elixir
+# Ensure metadata has meaningful JSON values for demonstration.
+seed_result =
+  config.repo.query!("""
+  UPDATE products
+  SET metadata = jsonb_build_object(
+    'price_band',
+    CASE
+      WHEN price >= 100 THEN 'premium'
+      WHEN price >= 50 THEN 'mid'
+      ELSE 'budget'
+    END,
+    'warehouse',
+    jsonb_build_object(
+      'zone',
+      CASE WHEN stock_quantity <= reorder_level THEN 'restock' ELSE 'in_stock' END,
+      'bin',
+      concat('A-', lpad((id % 25)::text, 2, '0'))
+    ),
+    'flags',
+    jsonb_build_array(
+      CASE WHEN active THEN 'active' ELSE 'inactive' END,
+      CASE WHEN featured THEN 'featured' ELSE 'standard' END
+    )
+  )
+  """)
+
+IO.puts("Metadata rows refreshed for JSON example: #{seed_result.num_rows}")
+
+json_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.json_select([
+    {:json_extract_text, "metadata", "$.price_band", as: "price_band"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", as: "warehouse_zone"},
+    {:json_extract_text, "metadata", "$.flags[0]", as: "primary_flag"}
+  ])
+  |> Selecto.json_filter({:json_contains, "metadata", %{"price_band" => "premium"}})
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.json_order_by({:json_extract_text, "metadata", "$.warehouse.zone", :asc})
+  |> Selecto.limit(10)
+
+{json_sql, json_params} = Selecto.to_sql(json_query)
+IO.puts("Generated SQL with JSON operations:\n")
+IO.puts(json_sql)
+IO.puts("\nParams: #{inspect(json_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(json_query) do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nPremium Products from JSON metadata:")
+    IO.puts("Columns: #{inspect(columns)}")
+
+    Enum.each(rows, fn [name, sku, price, price_band, warehouse_zone, primary_flag] ->
+      IO.puts(
+        "  #{name} (#{sku}) - $#{Decimal.round(price || Decimal.new(0), 2)} " <>
+          "| price_band=#{price_band} | zone=#{warehouse_zone} | flag=#{primary_flag}"
+      )
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (JSON Operations):
+
+* SQL includes JSON extraction operators (`->` / `->>`) for metadata paths
+* SQL includes JSON containment filter (`metadata @> ...`) for premium band
+* Output rows show regular columns plus JSON-derived columns (`price_band`, `warehouse_zone`, `primary_flag`)
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -1599,6 +1734,8 @@ This Livebook has demonstrated the core features of Selecto:
 10. **Subselects** - Embedding related rows as JSON arrays in each parent row
 11. **Set Operations** - Combining results with UNION / INTERSECT / EXCEPT
 12. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
+13. **Window Functions** - Ranking and analytics across related rows without collapsing detail
+14. **JSON Operations** - Extracting and filtering JSONB document data directly in SQL
 
 For more advanced features, see:
 
