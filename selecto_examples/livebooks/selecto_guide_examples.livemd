@@ -1718,6 +1718,223 @@ Expected output checks (JSON Operations):
 * SQL includes JSON containment filter (`metadata @> ...`) for premium band
 * Output rows show regular columns plus JSON-derived columns (`price_band`, `warehouse_zone`, `primary_flag`)
 
+## Section 15: Array Operations and UNNEST
+
+### Array Functions on Product Tags
+
+Business question: Which products match target tag groups, and how many tags does each carry?
+
+```elixir
+array_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "tags"])
+  |> Selecto.array_select([
+    {:array_length, "tags", 1, as: "tag_count"},
+    {:array_to_string, "tags", ", ", as: "tag_list"}
+  ])
+  |> Selecto.array_filter({:array_overlap, "tags", ["electronics", "outdoor"]})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(10)
+
+{array_sql, array_params} = Selecto.to_sql(array_query)
+IO.puts("Generated SQL for Array Operations query:\n")
+IO.puts(array_sql)
+IO.puts("\nParams: #{inspect(array_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(array_query, example: "Array Operations Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nProducts matching array overlap filter:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, sku, tags, tag_count, tag_list] ->
+      IO.puts("  #{name} (#{sku}) tags=#{inspect(tags)} | tag_count=#{tag_count} | tag_list=#{tag_list}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+### UNNEST Product Tags into Row-Level Output
+
+```elixir
+unnest_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "name",
+    {:field, {:raw_sql, "product_tag"}, "product_tag"}
+  ])
+  |> Selecto.unnest("tags", as: "product_tag")
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(12)
+
+{unnest_sql, unnest_params} = Selecto.to_sql(unnest_query)
+IO.puts("Generated SQL for UNNEST query:\n")
+IO.puts(unnest_sql)
+IO.puts("\nParams: #{inspect(unnest_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(unnest_query, example: "UNNEST Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nProduct tags expanded to one row per tag:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [product_name, product_tag] ->
+      IO.puts("  #{product_name} -> tag: #{product_tag}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Array + UNNEST):
+
+* SQL includes `ARRAY_LENGTH(...)` and `ARRAY_TO_STRING(...)` in the array query
+* SQL includes array overlap filter (`&&`) for tags
+* UNNEST SQL includes `CROSS JOIN LATERAL UNNEST(...)`
+* UNNEST output should show repeated product names with different tag values
+
+## Section 16: LATERAL Join
+
+### Explicit LATERAL Table Function
+
+Business question: Show active products and each tag as a row, using explicit `lateral_join/5`.
+
+```elixir
+lateral_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "name",
+    {:field, {:raw_sql, "tag_expanded"}, "product_tag"}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.lateral_join(:inner, {:unnest, "selecto_root.tags"}, "tag_expanded")
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(12)
+
+{lateral_sql, lateral_params} = Selecto.to_sql(lateral_query)
+IO.puts("Generated SQL with explicit LATERAL join:\n")
+IO.puts(lateral_sql)
+IO.puts("\nParams: #{inspect(lateral_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(lateral_query, example: "LATERAL Join Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nLATERAL result (product -> tag):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [product_name, product_tag] ->
+      IO.puts("  #{product_name} -> #{product_tag}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (LATERAL Join):
+
+* SQL includes `JOIN LATERAL UNNEST(selecto_root.tags) AS tag_expanded ON true`
+* Main query `FROM` remains the base table while lateral rows are expanded per base row
+* Output should mirror row-expansion behavior (multiple tags per product)
+
+## Section 17: CASE Expressions
+
+### Classify Order Size Tiers in SQL
+
+Business question: Label each order as `high_value`, `medium_value`, or `low_value` from total amount.
+
+```elixir
+case_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.case_when_select([
+    {[{"total", {:>=, Decimal.new("1000")}}], "high_value"},
+    {[{"total", {:>=, Decimal.new("500")}}], "medium_value"},
+    {[{"total", {:<, Decimal.new("500")}}], "low_value"}
+  ], else: "unknown", as: "order_size")
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{case_sql, case_params} = Selecto.to_sql(case_query)
+IO.puts("Generated SQL with CASE expression:\n")
+IO.puts(case_sql)
+IO.puts("\nParams: #{inspect(case_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(case_query, example: "CASE Expression Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrder size classification:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, status, total, order_size] ->
+      IO.puts("  #{order_number} (#{status}) total=$#{Decimal.round(total || Decimal.new(0), 2)} -> #{order_size}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (CASE Expressions):
+
+* SQL includes `CASE WHEN ... THEN ... ELSE ... END AS order_size`
+* Params include threshold values (`1000` and `500`) and labels
+* Output shows computed `order_size` alongside each order row
+
+## Section 18: VALUES Clause (Inline Lookup Table)
+
+### Join Orders to an Inline Status Mapping
+
+Business question: Can we map raw order status values to display labels without creating a physical lookup table?
+
+```elixir
+values_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      ["processing", "In Progress"],
+      ["shipped", "In Transit"],
+      ["delivered", "Completed"],
+      ["cancelled", "Cancelled"]
+    ],
+    columns: ["status", "status_label"],
+    as: "status_labels"
+  )
+  |> Selecto.join(:status_labels,
+    source: "status_labels",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      status_label: %{type: :string}
+    }
+  )
+  |> Selecto.select(["order_number", "status", "status_labels.status_label", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{values_sql, values_params} = Selecto.to_sql(values_query)
+IO.puts("Generated SQL with VALUES clause:\n")
+IO.puts(values_sql)
+IO.puts("\nParams: #{inspect(values_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(values_query, example: "VALUES Clause Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders with inline status labels:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, status, status_label, total] ->
+      IO.puts("  #{order_number}: status=#{status} (#{status_label}) total=$#{Decimal.round(total || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (VALUES Clause):
+
+* SQL starts with `WITH status_labels ("status", "status_label") AS (VALUES ...)`
+* Main query joins the inline CTE via `left join status_labels ... on status_labels.status = selecto_root.status`
+* Params should be `[]` for this literal lookup example
+* Output includes status plus the mapped `status_label`
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -1736,6 +1953,10 @@ This Livebook has demonstrated the core features of Selecto:
 12. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
 13. **Window Functions** - Ranking and analytics across related rows without collapsing detail
 14. **JSON Operations** - Extracting and filtering JSONB document data directly in SQL
+15. **Array Operations** - Filtering, sizing, and formatting PostgreSQL arrays
+16. **UNNEST + LATERAL** - Expanding array values into row-level results
+17. **CASE Expressions** - Conditional classification directly in SQL
+18. **VALUES Clauses** - Inline lookup tables via `WITH ... AS (VALUES ...)`
 
 For more advanced features, see:
 
