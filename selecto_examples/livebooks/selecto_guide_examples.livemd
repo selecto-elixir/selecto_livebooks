@@ -244,6 +244,7 @@ customer_domain = %{
       updated_at: %{type: :utc_datetime}
     }
   },
+  schemas: %{},
   joins: %{}
 }
 
@@ -2128,6 +2129,158 @@ Expected output checks (Execution Helpers):
 * `execute_one/2` returns `{:ok, {row, aliases}}` when exactly one row is returned
 * `execute_one/2` returns an error when multiple rows are returned
 
+## Section 22: Dynamic Subquery Joins (`join_subquery/4`)
+
+### Join Customers to a Filtered Order Subquery
+
+Business question: Which customers have delivered orders above $1000, and which order rows are those?
+
+```elixir
+high_value_delivered_orders =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["customer_id", "order_number", "total"])
+  |> Selecto.filter({:and, [
+    {"status", "delivered"},
+    {"total", {:>, 1000}}
+  ]})
+
+join_subquery_query =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.join_subquery(:high_value_delivered, high_value_delivered_orders,
+    type: :inner,
+    on: [%{left: "id", right: "customer_id"}]
+  )
+  |> Selecto.select([
+    "name",
+    "tier",
+    "high_value_delivered.order_number",
+    "high_value_delivered.total"
+  ])
+  |> Selecto.limit(10)
+
+{join_subquery_sql, join_subquery_params} = Selecto.to_sql(join_subquery_query)
+IO.puts("Generated SQL with dynamic subquery join:\n")
+IO.puts(join_subquery_sql)
+IO.puts("\nParams: #{inspect(join_subquery_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(join_subquery_query, example: "Dynamic Subquery Join Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nCustomers with high-value delivered orders:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, tier, order_number, total] ->
+      IO.puts("  #{name} (#{tier}) -> #{order_number} total=$#{Decimal.round(total || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Dynamic Subquery Join):
+
+* SQL contains `inner join ( ...subquery... ) high_value_delivered on selecto_root.id = high_value_delivered.customer_id`
+* Subquery filters are parameterized and appear in `Params` (expected: `"delivered"` and `1000`)
+* Output includes customer identity plus the matching high-value order row
+
+## Section 23: Parameterized Join Instances (`join_parameterize/4`)
+
+### Materialize the Same Join Twice with Independent Aliases
+
+Business question: Can we project the same relationship twice with separate join aliases?
+
+```elixir
+parameterized_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_parameterize(:customer, "alias_a")
+  |> Selecto.join_parameterize(:customer, "alias_b")
+  |> Selecto.select([
+    "order_number",
+    "customer:alias_a.name",
+    "customer:alias_b.tier"
+  ])
+  |> Selecto.limit(50)
+
+{parameterized_join_sql, parameterized_join_params} = Selecto.to_sql(parameterized_join_query)
+IO.puts("Generated SQL with parameterized join aliases:\n")
+IO.puts(parameterized_join_sql)
+IO.puts("\nParams: #{inspect(parameterized_join_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(parameterized_join_query, example: "Parameterized Join Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders with independently aliased customer projections:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, name_alias_a, tier_alias_b] ->
+      IO.puts("  #{order_number} -> alias_a.name=#{name_alias_a}, alias_b.tier=#{tier_alias_b}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Parameterized Join Instances):
+
+* SQL includes two aliased joins, e.g. `"customer:alias_a"` and `"customer:alias_b"`
+* Dot-notation fields `customer:alias_a.name` and `customer:alias_b.tier` resolve successfully
+* Output shows both projections selected from the independently aliased join instances
+
+## Section 24: Dynamic Custom Join (`join/3` with non-association source)
+
+### Attach Product Reviews Without Predeclaring a Domain Join
+
+Business question: Can we ad-hoc join products to `reviews` even if that relationship is not preconfigured in the domain joins?
+
+```elixir
+custom_join_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.join(:reviews,
+    source: "reviews",
+    type: :left,
+    owner_key: :id,
+    related_key: :product_id,
+    fields: %{
+      rating: %{type: :integer},
+      title: %{type: :string},
+      helpful_count: %{type: :integer}
+    }
+  )
+  |> Selecto.select([
+    "name",
+    "reviews.rating",
+    "reviews.title",
+    "reviews.helpful_count"
+  ])
+  |> Selecto.filter({:and, [
+    {"active", true},
+    {"reviews.rating", {:>=, 4}}
+  ]})
+  |> Selecto.order_by({"reviews.rating", :desc})
+  |> Selecto.limit(10)
+
+{custom_join_sql, custom_join_params} = Selecto.to_sql(custom_join_query)
+IO.puts("Generated SQL with dynamic custom join:\n")
+IO.puts(custom_join_sql)
+IO.puts("\nParams: #{inspect(custom_join_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(custom_join_query, example: "Dynamic Custom Join Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nHighly-rated product reviews (dynamic join):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, rating, title, helpful_count] ->
+      IO.puts("  #{name} -> rating=#{rating}, title=#{inspect(title)}, helpful=#{helpful_count}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Dynamic Custom Join):
+
+* SQL includes `left join reviews reviews on reviews.product_id = selecto_root.id`
+* Params include both base filter (`active = true`) and joined-table filter (`reviews.rating >= 4`)
+* Output includes product fields plus review columns from the ad-hoc join
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -2153,6 +2306,9 @@ This Livebook has demonstrated the core features of Selecto:
 19. **Multi-CTE Composition** - Attach and consume multiple CTEs with `with_ctes/2`
 20. **Array Manipulation** - Transform arrays with append/remove/string conversion in one query
 21. **Execution Helpers** - Inspect SQL/timing metadata and enforce single-row semantics
+22. **Dynamic Subquery Joins** - Join a query to an ad-hoc subquery built with Selecto
+23. **Parameterized Join Instances** - Materialize the same join multiple times with distinct aliases
+24. **Dynamic Custom Joins** - Attach non-association tables at runtime with explicit join keys
 
 For more advanced features, see:
 
