@@ -900,6 +900,79 @@ case result do
 end
 ```
 
+### Pivot Example: Retarget Delivered Orders to Line Items
+
+```elixir
+pivot_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.select([
+    {:field, "order_items.product_id", "product_id"},
+    {:field, "order_items.quantity", "quantity"},
+    {:field, "order_items.line_total", "line_total"}
+  ])
+
+{pivot_sql, pivot_params} = Selecto.to_sql(pivot_query)
+IO.puts("Generated SQL for Pivot query:\n")
+IO.puts(pivot_sql)
+IO.puts("\nParams: #{inspect(pivot_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(pivot_query, example: "Pivot Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nLine Items from Delivered Orders (pivoted view):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(Enum.take(rows, 10), fn [product_id, quantity, line_total] ->
+      IO.puts("  product_id=#{product_id}, qty=#{quantity}, line_total=$#{Decimal.round(line_total || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+### Subselect Example: Attach Order Items as JSON per Order
+
+```elixir
+subselect_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.subselect(
+    ["order_items[quantity, line_total]"],
+    format: :json_agg,
+    alias_prefix: "items"
+  )
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(5)
+
+{subselect_sql, subselect_params} = Selecto.to_sql(subselect_query)
+IO.puts("Generated SQL for Subselect query:\n")
+IO.puts(subselect_sql)
+IO.puts("\nParams: #{inspect(subselect_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(subselect_query, example: "Subselect Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nTop processing/shipped orders with embedded line items:")
+    IO.puts("Columns: #{inspect(columns)}")
+
+    Enum.each(rows, fn [order_number, status, total, items] ->
+      item_count = if is_list(items), do: length(items), else: 0
+      IO.puts("  #{order_number} (#{status}) total=$#{Decimal.round(total || Decimal.new(0), 2)} | item_count=#{item_count}")
+
+      items
+      |> List.wrap()
+      |> Enum.take(2)
+      |> Enum.each(fn item ->
+        IO.puts("    item: quantity=#{item["quantity"]}, line_total=#{item["line_total"]}")
+      end)
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
 ## Section 8: Composable Query Patterns
 
 ### Building Reusable Query Functions
@@ -1522,8 +1595,10 @@ This Livebook has demonstrated the core features of Selecto:
 6. **Joins** - Automatic joins via dot notation
 7. **Composable Patterns** - Building reusable query functions
 8. **Output Formats** - Transforming results for different use cases
-9. **Set Operations** - Combining results with UNION / INTERSECT / EXCEPT
-10. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
+9. **Pivoting** - Retargeting query focus to related schemas while preserving filter context
+10. **Subselects** - Embedding related rows as JSON arrays in each parent row
+11. **Set Operations** - Combining results with UNION / INTERSECT / EXCEPT
+12. **CTEs** - Using WITH and WITH RECURSIVE for modular query construction
 
 For more advanced features, see:
 
