@@ -1935,6 +1935,199 @@ Expected output checks (VALUES Clause):
 * Params should be `[]` for this literal lookup example
 * Output includes status plus the mapped `status_label`
 
+## Section 19: Multiple CTEs with `with_ctes/2`
+
+### Combine High-Value Orders with Customer Order Frequency
+
+Business question: Which high-value orders come from customers with repeat purchase activity?
+
+```elixir
+alias Selecto.Advanced.CTE
+
+high_value_orders_cte =
+  CTE.create_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.filter({"total", {:>, 500}})
+  end)
+
+customer_order_counts_cte =
+  CTE.create_cte("customer_order_counts", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["customer_id", {:count, "*"}])
+    |> Selecto.group_by(["customer_id"])
+  end)
+
+multi_cte_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_ctes([high_value_orders_cte, customer_order_counts_cte])
+  |> Selecto.join(:high_value_orders,
+    source: "high_value_orders",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{
+      total: %{type: :decimal},
+      customer_id: %{type: :integer}
+    }
+  )
+  |> Selecto.join(:customer_order_counts,
+    source: "customer_order_counts",
+    type: :inner,
+    owner_key: :customer_id,
+    related_key: :customer_id,
+    fields: %{
+      customer_id: %{type: :integer},
+      count: %{type: :integer}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "high_value_orders.total",
+    "customer_order_counts.count"
+  ])
+  |> Selecto.filter({"customer_order_counts.count", {:>=, 2}})
+  |> Selecto.order_by({"high_value_orders.total", :desc})
+  |> Selecto.limit(10)
+
+{multi_cte_sql, multi_cte_params} = Selecto.to_sql(multi_cte_query)
+IO.puts("Generated SQL with multiple CTEs:\n")
+IO.puts(multi_cte_sql)
+IO.puts("\nParams: #{inspect(multi_cte_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(multi_cte_query, example: "Multiple CTE Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nHigh-value orders from repeat customers:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, status, total, repeat_count] ->
+      IO.puts("  #{order_number} (#{status}) total=$#{Decimal.round(total || Decimal.new(0), 2)} | customer_orders=#{repeat_count}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Multiple CTEs):
+
+* SQL starts with `WITH ...` and contains both `high_value_orders AS (...)` and `customer_order_counts AS (...)`
+* Main query consumes both CTEs through explicit joins
+* Output includes order amount and per-customer order frequency
+
+## Section 20: Array Manipulation (`array_manipulate/3`)
+
+### Transform Product Tags for Display and Downstream Use
+
+Business question: How can we derive multiple array-based tag projections in one query?
+
+```elixir
+array_manipulate_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "tags"])
+  |> Selecto.array_manipulate([
+    {:array_append, "tags", "featured_livebook", [as: "tags_plus_featured"]},
+    {:array_remove, "tags", "outdoor", [as: "tags_without_outdoor"]},
+    {:array_to_string, "tags", " | ", [as: "tags_pipe"]}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.limit(10)
+
+{array_manipulate_sql, array_manipulate_params} = Selecto.to_sql(array_manipulate_query)
+IO.puts("Generated SQL with array manipulation:\n")
+IO.puts(array_manipulate_sql)
+IO.puts("\nParams: #{inspect(array_manipulate_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(array_manipulate_query, example: "Array Manipulation Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nArray manipulation sample rows:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, tags, tags_plus, tags_without_outdoor, tags_pipe] ->
+      IO.puts("  #{name}")
+      IO.puts("    tags=#{inspect(tags)}")
+      IO.puts("    tags_plus_featured=#{inspect(tags_plus)}")
+      IO.puts("    tags_without_outdoor=#{inspect(tags_without_outdoor)}")
+      IO.puts("    tags_pipe=#{tags_pipe}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Array Manipulation):
+
+* SQL includes `ARRAY_APPEND`, `ARRAY_REMOVE`, and `ARRAY_TO_STRING`
+* Params contain appended value, removed value, delimiter, and active filter
+* Output shows original and transformed tag projections side by side
+
+## Section 21: Execution Helpers (`execute_with_metadata/2`, `execute_one/2`)
+
+### Get SQL/Timing Metadata and Enforce Single-Row Semantics
+
+Business question: How do we inspect runtime SQL details and safely assert one-row results?
+
+```elixir
+metadata_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(3)
+
+IO.puts("execute_with_metadata/2 demo:\n")
+case Selecto.execute_with_metadata(metadata_query) do
+  {:ok, {rows, columns, _aliases}, metadata} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.puts("Row count: #{length(rows)}")
+    IO.puts("Metadata keys: #{inspect(Map.keys(metadata))}")
+    IO.puts("Execution time (ms): #{inspect(metadata[:execution_time])}")
+    IO.puts("Params: #{inspect(metadata[:params])}")
+    IO.puts("SQL preview:\n#{metadata[:sql]}")
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+one_row_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(1)
+
+IO.puts("\nexecute_one/2 success case:\n")
+case Selecto.execute_one(one_row_query) do
+  {:ok, {row, aliases}} ->
+    IO.puts("Single row: #{inspect(row)}")
+    IO.puts("Aliases: #{inspect(aliases)}")
+
+  {:error, error} ->
+    IO.puts("Unexpected error: #{inspect(error)}")
+end
+
+many_rows_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.limit(2)
+
+IO.puts("\nexecute_one/2 multiple-rows guard:\n")
+case Selecto.execute_one(many_rows_query) do
+  {:ok, {row, _aliases}} ->
+    IO.puts("Unexpected single row: #{inspect(row)}")
+
+  {:error, error} ->
+    IO.puts("Expected error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Execution Helpers):
+
+* `execute_with_metadata/2` returns query result plus metadata with `:sql`, `:params`, and `:execution_time`
+* `execute_one/2` returns `{:ok, {row, aliases}}` when exactly one row is returned
+* `execute_one/2` returns an error when multiple rows are returned
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -1957,6 +2150,9 @@ This Livebook has demonstrated the core features of Selecto:
 16. **UNNEST + LATERAL** - Expanding array values into row-level results
 17. **CASE Expressions** - Conditional classification directly in SQL
 18. **VALUES Clauses** - Inline lookup tables via `WITH ... AS (VALUES ...)`
+19. **Multi-CTE Composition** - Attach and consume multiple CTEs with `with_ctes/2`
+20. **Array Manipulation** - Transform arrays with append/remove/string conversion in one query
+21. **Execution Helpers** - Inspect SQL/timing metadata and enforce single-row semantics
 
 For more advanced features, see:
 
