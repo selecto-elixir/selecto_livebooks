@@ -33,6 +33,7 @@ defmodule SelectoExamples.Domains.CustomerDomain do
           updated_at: %{type: :utc_datetime, label: "Updated At"}
         }
       },
+      schemas: %{},
       joins: %{},
       default_selected: ["name", "email", "tier", "country", "active"],
       default_order_by: [{"name", :asc}]

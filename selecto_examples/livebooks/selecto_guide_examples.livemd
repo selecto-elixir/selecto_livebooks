@@ -2144,8 +2144,10 @@ high_value_delivered_orders =
     {"total", {:>, 1000}}
   ]})
 
+customer_domain = Map.put_new(config.customer_domain, :schemas, %{})
+
 join_subquery_query =
-  Selecto.configure(config.customer_domain, config.repo)
+  Selecto.configure(customer_domain, config.repo)
   |> Selecto.join_subquery(:high_value_delivered, high_value_delivered_orders,
     type: :inner,
     on: [%{left: "id", right: "customer_id"}]
@@ -2522,6 +2524,285 @@ Expected output checks (from_ecto Bootstrap):
 * Joined fields from Ecto associations (`category.name`, `supplier.company_name`) resolve
 * Generated SQL includes the expected joins and filter/order/limit clauses
 
+## Section 28: Simple CASE (`case_select/4`)
+
+### Bucket Order Status with Value-to-Label Mapping
+
+Business question: Can we map one column's discrete values to labels using a simple `CASE <column> WHEN ... THEN ...` expression?
+
+```elixir
+simple_case_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.case_select("status", [
+    {"processing", "Open"},
+    {"shipped", "In Transit"},
+    {"delivered", "Closed"},
+    {"cancelled", "Closed"}
+  ], else: "Other", as: "status_bucket")
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{simple_case_sql, simple_case_params} = Selecto.to_sql(simple_case_query)
+IO.puts("Generated SQL with simple CASE expression:\n")
+IO.puts(simple_case_sql)
+IO.puts("\nParams: #{inspect(simple_case_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(simple_case_query, example: "Simple CASE Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nSimple CASE results (status -> status_bucket):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, status, total, status_bucket] ->
+      IO.puts("  #{order_number} status=#{status} total=$#{Decimal.round(total || Decimal.new(0), 2)} -> #{status_bucket}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Simple CASE):
+
+* SQL includes `CASE status WHEN ... THEN ... ELSE ... END AS status_bucket`
+* Params include value/result pairs from the mapping list plus `else` value
+* Output includes original status and computed `status_bucket`
+
+## Section 29: `with_values/3` with Map Rows
+
+### Inline Status Metadata Using Inferred Columns
+
+Business question: Can we provide VALUES data as maps and let Selecto infer the column list automatically?
+
+```elixir
+values_map_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", priority_rank: 3, customer_label: "Open"},
+      %{status: "shipped", priority_rank: 2, customer_label: "On The Way"},
+      %{status: "delivered", priority_rank: 1, customer_label: "Complete"},
+      %{status: "cancelled", priority_rank: 4, customer_label: "Cancelled"}
+    ],
+    as: "status_priority"
+  )
+  |> Selecto.join(:status_priority,
+    source: "status_priority",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      priority_rank: %{type: :integer},
+      customer_label: %{type: :string}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "status_priority.priority_rank",
+    "status_priority.customer_label"
+  ])
+  |> Selecto.order_by({"status_priority.priority_rank", :asc})
+  |> Selecto.limit(10)
+
+{values_map_sql, values_map_params} = Selecto.to_sql(values_map_query)
+IO.puts("Generated SQL with map-row VALUES clause:\n")
+IO.puts(values_map_sql)
+IO.puts("\nParams: #{inspect(values_map_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(values_map_query, example: "VALUES Map-Row Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders with inferred map-row status metadata:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, status, priority_rank, customer_label] ->
+      IO.puts("  #{order_number}: status=#{status} priority=#{priority_rank} label=#{customer_label}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Map-Row VALUES):
+
+* SQL starts with `WITH status_priority (...) AS (VALUES ...)`
+* Column names are inferred from map keys (deterministic sorted order in generated SQL)
+* Output includes joined fields from the inferred VALUES table
+
+## Section 30: Explicit `join/3` with `on:` Conditions
+
+### Custom Join Conditions Without Owner/Related Key Pairing
+
+Business question: Can we define join predicates explicitly with `on: [%{left: ..., right: ...}]` when adding custom joins?
+
+```elixir
+join_on_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:customer_lookup,
+    source: "customers",
+    type: :inner,
+    on: [%{left: "customer_id", right: "id"}],
+    fields: %{
+      name: %{type: :string},
+      tier: %{type: :string}
+    }
+  )
+  |> Selecto.select(["order_number", "customer_lookup.name", "customer_lookup.tier", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{join_on_sql, join_on_params} = Selecto.to_sql(join_on_query)
+IO.puts("Generated SQL with explicit on: join conditions:\n")
+IO.puts(join_on_sql)
+IO.puts("\nParams: #{inspect(join_on_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(join_on_query, example: "Explicit on: Join Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders with explicit on: customer lookup join:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, customer_name, customer_tier, total] ->
+      IO.puts("  #{order_number} -> #{customer_name} (#{customer_tier}) total=$#{Decimal.round(total || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Explicit `on:`):
+
+* SQL includes `... join customers customer_lookup on selecto_root.customer_id = customer_lookup.id`
+* The join is built from `on:` conditions without relying on inferred key names
+* Dot-notation fields from the custom join (`customer_lookup.name`, `customer_lookup.tier`) resolve
+
+## Section 31: Advanced Execution Formats (`typed_maps`, `stream`)
+
+### Type-Coerced Maps and Streaming Results
+
+Business question: Beyond maps/json/csv, can we return typed maps and lazily-consumed streams from execution?
+
+```elixir
+advanced_format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "price", "active"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(5)
+
+IO.puts("Typed maps format:")
+case Selecto.execute(advanced_format_query, format: {:typed_maps, [keys: :strings, coerce: :safe]}) do
+  {:ok, typed_maps} ->
+    Enum.each(typed_maps, fn row_map ->
+      IO.puts("  #{row_map["name"]} -> price=#{inspect(row_map["price"])} active=#{inspect(row_map["active"])}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+IO.puts("\nStream format (maps):")
+case Selecto.execute(advanced_format_query, format: {:stream, :maps}) do
+  {:ok, row_stream} ->
+    first_rows = Enum.take(row_stream, 3)
+    IO.puts("First 3 streamed rows:")
+    Enum.each(first_rows, fn row_map ->
+      IO.puts("  #{inspect(row_map)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Advanced Formats):
+
+* `format: {:typed_maps, ...}` returns maps with configured coercion behavior
+* `format: {:stream, :maps}` returns a stream that can be consumed lazily (`Enum.take/2`)
+* Streamed map keys resolve to selected field names (not synthetic alias UUIDs)
+
+## Section 32: Domain-Level Join Patterns (`join_type`)
+
+### Configure OLAP and Hierarchical Behavior in Domain Joins
+
+Business question: How do we express advanced join intent at the domain layer (OLAP and hierarchy), separate from raw recursive SQL?
+
+```elixir
+# Variant A: OLAP star-dimension join type (runnable query)
+olap_domain =
+  put_in(config.order_domain, [:joins, :customer, :type], :star_dimension)
+
+olap_query =
+  Selecto.configure(olap_domain, config.repo)
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(5)
+
+{olap_sql, olap_params} = Selecto.to_sql(olap_query)
+IO.puts("Generated SQL with star_dimension join type:\n")
+IO.puts(olap_sql)
+IO.puts("\nParams: #{inspect(olap_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(olap_query, example: "OLAP join_type Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nTop customers by revenue (star_dimension join type):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [customer_name, order_count, total_revenue] ->
+      IO.puts("  #{customer_name}: orders=#{order_count}, total=$#{Decimal.round(total_revenue || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+# Variant B: Hierarchical join type metadata (domain-level configuration inspection)
+hierarchy_domain =
+  config.employee_domain
+  |> put_in([:source, :associations, :manager_tree], %{
+    field: :manager_tree,
+    queryable: :employees,
+    owner_key: :manager_id,
+    related_key: :id
+  })
+  |> put_in([:joins, :manager_tree], %{
+    type: :hierarchical,
+    hierarchy_type: :adjacency_list,
+    depth_limit: 6,
+    parent_field: "manager_id",
+    name_field: "first_name"
+  })
+
+hierarchy_selecto = Selecto.configure(hierarchy_domain, config.repo)
+manager_tree_join = Selecto.joins(hierarchy_selecto)[:manager_tree]
+
+IO.puts("\nHierarchical join metadata preview:")
+IO.puts("  join_type: #{inspect(manager_tree_join.join_type)}")
+IO.puts("  source: #{inspect(manager_tree_join.source)}")
+IO.puts("  hierarchy_depth: #{inspect(Map.get(manager_tree_join, :hierarchy_depth))}")
+
+hierarchy_fields =
+  hierarchy_selecto
+  |> Selecto.available_fields()
+  |> Enum.map(fn
+    {field_name, _meta} when is_binary(field_name) -> field_name
+    {field_name, _meta} when is_atom(field_name) -> Atom.to_string(field_name)
+    field_name when is_binary(field_name) -> field_name
+    field_name when is_atom(field_name) -> Atom.to_string(field_name)
+    other -> inspect(other)
+  end)
+  |> Enum.filter(&String.contains?(&1, "manager_tree"))
+  |> Enum.take(12)
+
+IO.puts("  Sample hierarchical fields:")
+Enum.each(hierarchy_fields, fn field -> IO.puts("    #{field}") end)
+```
+
+Expected output checks (Domain-Level Join Patterns):
+
+* `:star_dimension` join type generates and executes an OLAP-friendly aggregate query
+* Join metadata reflects the configured advanced marker (`:hierarchical_adjacency`) for hierarchy joins
+* Hierarchical field set is discoverable from the configured domain (without hand-written recursive SQL in this section)
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -2553,6 +2834,11 @@ This Livebook has demonstrated the core features of Selecto:
 25. **Execution Format Options** - Return maps/JSON/CSV directly from `execute/2`
 26. **Advanced LATERAL Variants** - Use both subquery-builder and table-function forms
 27. **Ecto Bootstrap** - Derive Selecto domains from Ecto schemas with `from_ecto/3`
+28. **Simple CASE** - Map discrete column values with `case_select/4`
+29. **Map-Row VALUES** - Infer VALUES columns directly from map keys
+30. **Explicit `on:` Joins** - Define custom join predicates with `join/3`
+31. **Advanced Formats** - Use `{:typed_maps, ...}` and `{:stream, ...}` execution formats
+32. **Domain-Level Join Patterns** - Configure OLAP and hierarchical intent via `join_type`
 
 For more advanced features, see:
 
