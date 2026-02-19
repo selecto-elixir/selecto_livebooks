@@ -2281,6 +2281,247 @@ Expected output checks (Dynamic Custom Join):
 * Params include both base filter (`active = true`) and joined-table filter (`reviews.rating >= 4`)
 * Output includes product fields plus review columns from the ad-hoc join
 
+## Section 25: Output Formats via Execution Options
+
+### Return Maps, JSON, and CSV Directly from `Selecto.execute/2`
+
+Business question: Can we get formatted payloads directly from execution instead of manually transforming `{rows, columns, aliases}`?
+
+```elixir
+format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(5)
+
+IO.puts("Maps format (expected: one map per row, keyed by selected columns):")
+case Selecto.execute(format_query, format: :maps) do
+  {:ok, maps} ->
+    Enum.each(maps, fn row_map ->
+      IO.puts("  #{row_map["name"]} (#{row_map["sku"]}) -> $#{row_map["price"]}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+IO.puts("\nJSON format (expected: JSON array with name/sku/price fields):")
+case Selecto.execute(format_query, format: {:json, [pretty: true]}) do
+  {:ok, json_string} ->
+    IO.puts(json_string)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+IO.puts("\nCSV format (expected: header row plus five product rows):")
+case Selecto.execute(format_query, format: :csv) do
+  {:ok, csv_string} ->
+    IO.puts(csv_string)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+IO.puts("\nMaps format + metadata (expected: maps + sql/params/execution_time):")
+case Selecto.execute_with_metadata(format_query, format: :maps) do
+  {:ok, maps, metadata} ->
+    IO.puts("Row count: #{length(maps)}")
+    IO.puts("Execution time (ms): #{metadata[:execution_time]}")
+    IO.puts("Params: #{inspect(metadata[:params])}")
+    IO.puts("SQL:\n#{metadata[:sql]}")
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Execution Format Options):
+
+* `format: :maps` returns a list of maps keyed by selected columns
+* `format: {:json, ...}` returns a JSON string payload
+* `format: :csv` returns CSV text with headers
+* `execute_with_metadata/2` still returns `:sql`, `:params`, and `:execution_time` with formatted output
+
+## Section 26: Additional LATERAL Join Variants
+
+### Subquery Builder and Table Function Forms
+
+Business question: How do we use `lateral_join/5` beyond UNNEST?
+
+```elixir
+# Variant A: Subquery builder form
+lateral_subquery_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "name",
+    "category.name",
+    {:field, {:raw_sql, "category_stats.count"}, "active_products_in_category"}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.lateral_join(:left,
+    fn _base_query ->
+      Selecto.configure(config.product_domain, config.repo)
+      |> Selecto.select([{:count, "*"}])
+      |> Selecto.filter({"active", true})
+      |> Selecto.filter({:raw_sql_filter, "selecto_root.category_id = category.id"})
+    end,
+    "category_stats"
+  )
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(5)
+
+{lateral_subquery_sql, lateral_subquery_params} = Selecto.to_sql(lateral_subquery_query)
+IO.puts("Generated SQL (LATERAL subquery form):\n")
+IO.puts(lateral_subquery_sql)
+IO.puts("\nParams: #{inspect(lateral_subquery_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(lateral_subquery_query, example: "LATERAL Subquery Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nProducts with active-product counts for their category:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, category_name, active_products_in_category] ->
+      IO.puts("  #{name} (#{category_name}) -> active_products_in_category=#{active_products_in_category}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+
+# Variant B: Table function form (generate_series)
+generate_series_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "id",
+    "name",
+    {:field, {:raw_sql, "period_slot"}, "period_slot"}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.filter({"id", {:<=, 3}})
+  |> Selecto.lateral_join(:inner,
+    {:function, :generate_series, [1, "selecto_root.id"]},
+    "period_slot"
+  )
+  |> Selecto.order_by({"id", :asc})
+  |> Selecto.limit(12)
+
+{generate_series_sql, generate_series_params} = Selecto.to_sql(generate_series_query)
+IO.puts("\nGenerated SQL (LATERAL function form):\n")
+IO.puts(generate_series_sql)
+IO.puts("\nParams: #{inspect(generate_series_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(generate_series_query, example: "LATERAL Function Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nLATERAL generate_series rows (values from 1..product_id for id <= 3):")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [id, name, period_slot] ->
+      IO.puts("  id=#{id} #{name} -> period_slot=#{period_slot}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Additional LATERAL Variants):
+
+* Subquery form emits `LEFT JOIN LATERAL ( ... ) AS category_stats ON true` and references `category.id` in the subquery filter
+* Function form emits `INNER JOIN LATERAL GENERATE_SERIES(...) AS period_slot ON true`
+* Params include lateral inputs and outer filters in stable order
+
+## Section 27: Bootstrap from Ecto (`from_ecto/3`)
+
+### Generate a Selecto Domain from an Ecto Schema
+
+Business question: Can we start from Ecto schemas instead of hand-authoring a full Selecto domain map?
+
+```elixir
+defmodule SelectoExamples.LivebookSchemas.Category do
+  use Ecto.Schema
+
+  @primary_key {:id, :id, autogenerate: false}
+  schema "categories" do
+    field :name, :string
+  end
+end
+
+defmodule SelectoExamples.LivebookSchemas.Supplier do
+  use Ecto.Schema
+
+  @primary_key {:id, :id, autogenerate: false}
+  schema "suppliers" do
+    field :company_name, :string
+  end
+end
+
+defmodule SelectoExamples.LivebookSchemas.Product do
+  use Ecto.Schema
+
+  @primary_key {:id, :id, autogenerate: false}
+  schema "products" do
+    field :name, :string
+    field :sku, :string
+    field :price, :decimal
+    field :active, :boolean
+
+    belongs_to :category, SelectoExamples.LivebookSchemas.Category
+    belongs_to :supplier, SelectoExamples.LivebookSchemas.Supplier
+  end
+end
+
+ecto_selecto =
+  Selecto.from_ecto(
+    config.repo,
+    SelectoExamples.LivebookSchemas.Product,
+    joins: [:category, :supplier]
+  )
+
+IO.puts("Available fields sample from Ecto bootstrap:")
+ecto_selecto
+|> Selecto.available_fields()
+|> Enum.map(fn
+  {field_name, _meta} when is_binary(field_name) -> field_name
+  {field_name, _meta} when is_atom(field_name) -> Atom.to_string(field_name)
+  field_name when is_binary(field_name) -> field_name
+  field_name when is_atom(field_name) -> Atom.to_string(field_name)
+  other -> inspect(other)
+end)
+|> Enum.sort()
+|> Enum.take(20)
+|> Enum.each(fn field -> IO.puts("  #{field}") end)
+
+from_ecto_query =
+  ecto_selecto
+  |> Selecto.select(["name", "sku", "price", "category.name", "supplier.company_name"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(10)
+
+{from_ecto_sql, from_ecto_params} = Selecto.to_sql(from_ecto_query)
+IO.puts("\nGenerated SQL from from_ecto/3 domain:\n")
+IO.puts(from_ecto_sql)
+IO.puts("\nParams: #{inspect(from_ecto_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(from_ecto_query, example: "from_ecto Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nTop products from Ecto-bootstrapped Selecto:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, sku, price, category_name, supplier_name] ->
+      IO.puts("  #{name} (#{sku}) $#{Decimal.round(price || Decimal.new(0), 2)} | #{category_name} | #{supplier_name}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (from_ecto Bootstrap):
+
+* `Selecto.from_ecto/3` creates a usable Selecto instance from `Product` schema metadata
+* Joined fields from Ecto associations (`category.name`, `supplier.company_name`) resolve
+* Generated SQL includes the expected joins and filter/order/limit clauses
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -2309,6 +2550,9 @@ This Livebook has demonstrated the core features of Selecto:
 22. **Dynamic Subquery Joins** - Join a query to an ad-hoc subquery built with Selecto
 23. **Parameterized Join Instances** - Materialize the same join multiple times with distinct aliases
 24. **Dynamic Custom Joins** - Attach non-association tables at runtime with explicit join keys
+25. **Execution Format Options** - Return maps/JSON/CSV directly from `execute/2`
+26. **Advanced LATERAL Variants** - Use both subquery-builder and table-function forms
+27. **Ecto Bootstrap** - Derive Selecto domains from Ecto schemas with `from_ecto/3`
 
 For more advanced features, see:
 
