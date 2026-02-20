@@ -2226,6 +2226,62 @@ Expected output checks (Parameterized Join Instances):
 * Dot-notation fields `customer:alias_a.name` and `customer:alias_b.tier` resolve successfully
 * Output shows both projections selected from the independently aliased join instances
 
+### Same-Join Filtered Aliases (lf1/lf2-style pattern)
+
+Business question: Can we generate two filtered aliases from the same base join (equivalent to `lf1.type = 1` and `lf2.type = 2`)?
+
+```elixir
+# Enable parameterized filtering on the base join by declaring filterable fields.
+order_domain_with_customer_filters =
+  put_in(config.order_domain, [:joins, :customer, :filters], %{
+    "tier" => %{type: "string"}
+  })
+
+tier_parameterized_query =
+  Selecto.configure(order_domain_with_customer_filters, config.repo)
+  |> Selecto.join_parameterize(:customer, "tier_premium", tier: "premium")
+  |> Selecto.join_parameterize(:customer, "tier_standard", tier: "standard")
+  |> Selecto.select([
+    "order_number",
+    "customer:tier_premium.name",
+    "customer:tier_standard.name"
+  ])
+  |> Selecto.limit(25)
+
+{tier_parameterized_sql, tier_parameterized_params} = Selecto.to_sql(tier_parameterized_query)
+
+IO.puts("Generated SQL with filtered parameterized aliases:\n")
+IO.puts(tier_parameterized_sql)
+IO.puts("\nParams: #{inspect(tier_parameterized_params)}")
+
+premium_on? = String.contains?(tier_parameterized_sql, "\"customer:tier_premium\".tier = $1")
+standard_on? = String.contains?(tier_parameterized_sql, "\"customer:tier_standard\".tier = $2")
+
+IO.puts("\nON-clause checks:")
+IO.puts("  premium alias filter present? #{premium_on?}")
+IO.puts("  standard alias filter present? #{standard_on?}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(tier_parameterized_query, example: "Parameterized Join Filter Wiring Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders with tier-filtered customer aliases:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, premium_name, standard_name] ->
+      IO.puts("  #{order_number} -> premium_alias=#{inspect(premium_name)}, standard_alias=#{inspect(standard_name)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (Same-Join Filtered Aliases):
+
+* SQL includes `"customer:tier_premium"` and `"customer:tier_standard"` aliases
+* SQL `ON` clause contains alias-specific filters:
+  * `"customer:tier_premium".tier = $1`
+  * `"customer:tier_standard".tier = $2`
+* Params are ordered as `["premium", "standard"]`
+
 ## Section 24: Dynamic Custom Join (`join/3` with non-association source)
 
 ### Attach Product Reviews Without Predeclaring a Domain Join
