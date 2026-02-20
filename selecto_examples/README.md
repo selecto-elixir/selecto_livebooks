@@ -1,21 +1,54 @@
-# SelectoExamples
+# Selecto Examples
 
-**TODO: Add description**
+`selecto_examples` is the runnable app used by the `selecto_livebooks` guide.
+It provides a Postgres dataset plus domain definitions for trying Selecto
+queries interactively.
 
-## Installation
+## What Is Included
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `selecto_examples` to your list of dependencies in `mix.exs`:
+- Ecto schemas for products, orders, customers, employees, tags, and reviews
+- Migrations and seed data
+- Domain modules for Selecto examples
+- Livebook notebook under `livebooks/selecto_guide_examples.livemd`
 
-```elixir
-def deps do
-  [
-    {:selecto_examples, "~> 0.1.0"}
-  ]
-end
+## Requirements
+
+- Elixir `~> 1.17`
+- PostgreSQL `13+`
+
+## Setup
+
+```bash
+mix deps.get
+mix setup
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/selecto_examples>.
+`mix setup` runs:
 
+1. `deps.get`
+2. `ecto.create`
+3. `ecto.migrate`
+4. `priv/repo/seeds.exs`
+
+## Run Tests
+
+```bash
+mix test
+```
+
+## Open the Livebook
+
+From repo root:
+
+```bash
+livebook server
+```
+
+Then open:
+
+`selecto_examples/livebooks/selecto_guide_examples.livemd`
+
+## Notes
+
+- `selecto` is pulled from GitHub (`seeken/selecto`, branch `main`) to track
+  current development.

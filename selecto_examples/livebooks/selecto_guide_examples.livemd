@@ -20,7 +20,7 @@ Before running these examples, make sure you have:
 2. Run the migrations and seeds
 
 ```bash
-cd vendor/selecto_livebooks/selecto_examples
+cd selecto_examples
 mix setup
 ```
 
@@ -2896,8 +2896,4 @@ This Livebook has demonstrated the core features of Selecto:
 31. **Advanced Formats** - Use `{:typed_maps, ...}` and `{:stream, ...}` execution formats
 32. **Domain-Level Join Patterns** - Configure OLAP and hierarchical intent via `join_type`
 
-For more advanced features, see:
-
-* [Advanced Usage](../../../../selecto/guides/advanced_usage.md)
-* [SQL Functions](../../../../selecto/guides/sql_functions.md)
-* [Complex Join Patterns](../../../../selecto/guides/complex_join_patterns.md)
+For more advanced feature updates, follow the `selecto` repository directly.

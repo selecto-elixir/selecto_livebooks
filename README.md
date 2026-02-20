@@ -1,75 +1,63 @@
 # Selecto Livebooks
 
-Interactive Livebook examples demonstrating the Selecto SQL query builder.
+`selecto_livebooks` is a standalone example repo for learning and testing
+the Selecto query builder in a real Elixir project and Livebook.
 
-## Contents
+It includes:
 
-- `selecto_examples/` - Elixir project with Ecto schemas and seed data
-- `selecto_examples/livebooks/` - Livebook notebooks
+- `selecto_examples/` - an Ecto app with schemas, migrations, and seed data
+- `selecto_examples/livebooks/selecto_guide_examples.livemd` - an interactive
+  end-to-end guide covering core and advanced Selecto features
 
-## Setup
+## What This Repo Does
 
-1. Navigate to the project directory:
-   ```bash
-   cd selecto_examples
-   ```
+The examples are centered on an e-commerce-style dataset and demonstrate:
 
-2. Install dependencies and set up the database:
-   ```bash
-   mix setup
-   ```
-
-   This will:
-   - Install dependencies
-   - Create the PostgreSQL database
-   - Run migrations
-   - Seed sample data
-
-3. Open the Livebook:
-   - Start Livebook: `livebook server`
-   - Open `selecto_examples/livebooks/selecto_guide_examples.livemd`
-
-## Database Schema
-
-The example database includes an e-commerce schema:
-
-- **Categories** - Product categories
-- **Suppliers** - Product suppliers
-- **Products** - Products with category/supplier relationships
-- **Tags** - Product tags (many-to-many)
-- **Customers** - Customer accounts with tiers
-- **Orders** - Customer orders
-- **Order Items** - Line items for orders
-- **Employees** - Employee hierarchy for recursive CTE examples
-- **Reviews** - Product reviews
-
-## Sample Data
-
-The seed script creates:
-- 8 categories
-- 8 suppliers
-- 35 products
-- 8 tags
-- 15 customers
-- 200 orders with items
-- 15 employees in a hierarchy
-- ~100 reviews
-
-## Livebook Examples
-
-The main Livebook demonstrates:
-
-1. Basic query building
-2. Filtering with various operators
-3. Sorting and pagination
-4. Aggregates and GROUP BY
-5. Joins and associations
-6. Composable query patterns
-7. Output format transformations
-8. A complete sales dashboard
+1. Domain configuration (`source`, `schemas`, `joins`)
+2. Query building with `select`, `filter`, `order_by`, `group_by`
+3. Joins (including dynamic joins and parameterized join aliases)
+4. Pivoting, subselects, CTEs, recursive CTEs, set operations
+5. Window functions, JSON/array operations, CASE expressions, VALUES
+6. Different execution/output formats
 
 ## Requirements
 
-- Elixir 1.17+
-- PostgreSQL 13+
-- Livebook 0.12+
+- Elixir `~> 1.17`
+- PostgreSQL `13+`
+- Livebook `0.12+`
+
+## Quick Start
+
+1. Go to the example app:
+   ```bash
+   cd selecto_examples
+   ```
+2. Install deps and prepare the database:
+   ```bash
+   mix setup
+   ```
+3. Start Livebook:
+   ```bash
+   livebook server
+   ```
+4. Open:
+   `selecto_examples/livebooks/selecto_guide_examples.livemd`
+
+## Dependency Source
+
+`selecto_examples` and the Livebook install `selecto` directly from GitHub
+(`seeken/selecto`, branch `main`) so examples track ongoing development.
+
+## Database Model
+
+The seed data creates:
+
+- categories
+- suppliers
+- products
+- tags
+- customers
+- orders
+- order_items
+- employees (hierarchy)
+- reviews
