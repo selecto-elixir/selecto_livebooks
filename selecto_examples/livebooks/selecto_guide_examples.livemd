@@ -2859,6 +2859,300 @@ Expected output checks (Domain-Level Join Patterns):
 * Join metadata reflects the configured advanced marker (`:hierarchical_adjacency`) for hierarchy joins
 * Hierarchical field set is discoverable from the configured domain (without hand-written recursive SQL in this section)
 
+## Section 33: Domain and Field Introspection Helpers
+
+### Inspect Domain Metadata and Resolve Fields Programmatically
+
+Business question: How can a UI or service layer discover fields/joins/types without hardcoding schema details?
+
+```elixir
+introspection_selecto = Selecto.configure(config.product_domain, config.repo)
+
+source_table = Selecto.source_table(introspection_selecto)
+join_ids = introspection_selecto |> Selecto.joins() |> Map.keys()
+column_count = introspection_selecto |> Selecto.columns() |> map_size()
+filter_count =
+  case Selecto.filters(introspection_selecto) do
+    filters when is_map(filters) -> map_size(filters)
+    _ -> 0
+  end
+
+price_field = Selecto.field(introspection_selecto, "price")
+resolved_category_name = Selecto.resolve_field(introspection_selecto, "category.name")
+suggested_fields = Selecto.field_suggestions(introspection_selecto, "cat")
+
+available_field_preview =
+  introspection_selecto
+  |> Selecto.available_fields()
+  |> Enum.take(8)
+
+domain_data = Selecto.domain_data(introspection_selecto)
+
+domain_name =
+  case domain_data do
+    %{name: name} -> name
+    %{"name" => name} -> name
+    _ -> "N/A"
+  end
+
+query_set_keys =
+  case Selecto.set(introspection_selecto) do
+    query_set when is_map(query_set) ->
+      query_set
+      |> Map.keys()
+      |> Enum.take(10)
+
+    _ ->
+      []
+  end
+
+IO.puts("Domain name: #{domain_name}")
+IO.puts("Source table: #{source_table}")
+IO.puts("Join ids: #{inspect(join_ids)}")
+IO.puts("Column count: #{column_count}")
+IO.puts("Filter count: #{filter_count}")
+IO.puts("Field config for `price`: #{inspect(price_field)}")
+IO.puts("Resolved `category.name`: #{inspect(resolved_category_name)}")
+IO.puts("Field suggestions for `cat`: #{inspect(suggested_fields)}")
+IO.puts("Available fields preview: #{inspect(available_field_preview)}")
+IO.puts("Query set keys preview: #{inspect(query_set_keys)}")
+```
+
+Expected output checks (Introspection Helpers):
+
+* Domain/source metadata is discoverable via Selecto helper APIs
+* `resolve_field/2` returns a structured success/error tuple
+* `field_suggestions/2` and `available_fields/1` provide UX-friendly discovery data
+
+## Section 34: Type Inference and Compatibility Helpers
+
+### Validate Expression Types Before Executing Queries
+
+Business question: How can we preflight types for dynamic query builders (for example, UI condition builders)?
+
+```elixir
+type_selecto = Selecto.configure(config.product_domain, config.repo)
+
+{:ok, price_type} = Selecto.infer_type(type_selecto, "price")
+{:ok, count_type} = Selecto.infer_type(type_selecto, {:count, "*"})
+{:ok, sum_type} = Selecto.infer_type(type_selecto, {:sum, "price"})
+{:ok, literal_type} = Selecto.infer_type(type_selecto, {:literal, true})
+
+numeric_compat = Selecto.types_compatible?(:integer, :decimal)
+string_bool_compat = Selecto.types_compatible?(:string, :boolean)
+
+price_category = Selecto.type_category(price_type)
+count_category = Selecto.type_category(count_type)
+
+IO.puts("Inferred type of `price`: #{inspect(price_type)} (category: #{inspect(price_category)})")
+IO.puts("Inferred type of `count(*)`: #{inspect(count_type)} (category: #{inspect(count_category)})")
+IO.puts("Inferred type of `sum(price)`: #{inspect(sum_type)}")
+IO.puts("Inferred type of literal `true`: #{inspect(literal_type)}")
+IO.puts("Type compatible? integer vs decimal -> #{inspect(numeric_compat)}")
+IO.puts("Type compatible? string vs boolean -> #{inspect(string_bool_compat)}")
+```
+
+Expected output checks (Type Helpers):
+
+* `infer_type/2` returns concrete SQL-oriented types for fields and expressions
+* `types_compatible?/2` supports safe comparison checks for dynamic filter builders
+* `type_category/1` classifies inferred types for UI/operator selection
+
+## Section 35: SQL Builder API (`gen_sql/2`) vs `to_sql/1`
+
+### Access SQL, Params, and Alias Metadata Directly
+
+Business question: When should we use `gen_sql/2` instead of `to_sql/1`?
+
+```elixir
+gen_sql_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "total", "customer.tier"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(5)
+
+{gen_sql_sql, gen_sql_aliases, gen_sql_params} = Selecto.gen_sql(gen_sql_query, [])
+{to_sql_sql, to_sql_params} = Selecto.to_sql(gen_sql_query)
+
+normalize_sql = fn sql -> sql |> String.replace(~r/\s+/, " ") |> String.trim() end
+
+alias_count =
+  cond do
+    is_map(gen_sql_aliases) -> map_size(gen_sql_aliases)
+    is_list(gen_sql_aliases) -> length(gen_sql_aliases)
+    true -> 0
+  end
+
+IO.puts("gen_sql SQL:\n#{gen_sql_sql}")
+IO.puts("\ngen_sql params: #{inspect(gen_sql_params)}")
+IO.puts("gen_sql alias count: #{alias_count}")
+IO.puts("to_sql params: #{inspect(to_sql_params)}")
+IO.puts("SQL text equivalent? #{normalize_sql.(gen_sql_sql) == normalize_sql.(to_sql_sql)}")
+IO.puts("Params equivalent? #{gen_sql_params == to_sql_params}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(gen_sql_query, example: "gen_sql vs to_sql Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nExecuted rows:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, total, tier] ->
+      IO.puts("  #{order_number} -> total=$#{Decimal.round(total || Decimal.new(0), 2)} tier=#{tier}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (`gen_sql/2` vs `to_sql/1`):
+
+* `gen_sql/2` returns SQL + params + alias metadata
+* `to_sql/1` returns SQL + params for direct inspection and debugging
+* SQL and params are equivalent for the same query definition
+
+## Section 36: Advanced Filter Operators (`:subquery`, `:text_search`)
+
+### Use SQL Subqueries and Full-Text Search from `Selecto.filter/2`
+
+Business question: How do we express subquery membership and text search using typed filter operators?
+
+```elixir
+subquery_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "customer_id", "status", "total"])
+  # Keep parentheses in the raw subquery for compatibility with older Selecto builds.
+  |> Selecto.filter({"customer_id", {:subquery, :in, "(SELECT id FROM customers WHERE tier = 'premium')", []}})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{subquery_filter_sql, subquery_filter_params} = Selecto.to_sql(subquery_filter_query)
+IO.puts("Subquery filter SQL:\n#{subquery_filter_sql}")
+IO.puts("\nSubquery filter params: #{inspect(subquery_filter_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(subquery_filter_query, example: "Subquery Filter Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nOrders limited to customers returned by subquery:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [order_number, customer_id, status, total] ->
+      IO.puts("  #{order_number} -> customer_id=#{customer_id}, status=#{status}, total=$#{Decimal.round(total || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error (subquery): #{inspect(error)}")
+end
+
+text_search_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "description"])
+  |> Selecto.filter({"name", {:text_search, "wireless"}})
+  |> Selecto.limit(10)
+
+{text_search_sql, text_search_params} = Selecto.to_sql(text_search_query)
+IO.puts("\nText-search SQL:\n#{text_search_sql}")
+IO.puts("\nText-search params: #{inspect(text_search_params)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(text_search_query, example: "Text Search Filter Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nProducts matching text search:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [name, description] ->
+      preview = (description || "") |> String.slice(0, 60)
+      IO.puts("  #{name} -> #{preview}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error (text search): #{inspect(error)}")
+end
+```
+
+Expected output checks (Advanced Filters):
+
+* Subquery filter emits `IN (SELECT ...)` style SQL via `{:subquery, ...}`
+* Text-search filter emits PostgreSQL full-text search expression
+* Both filter forms can be composed with standard `select/order/limit`
+
+## Section 37: Additional Domain Join Marker (`:snowflake_dimension`)
+
+### Preview Snowflake Join Intent at the Domain Layer
+
+Business question: Can we mark a join as snowflake-oriented while keeping the query API unchanged?
+
+```elixir
+snowflake_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    config.order_domain.joins.customer
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      # Non-empty normalization chain is required by Selecto.DomainValidator
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+snowflake_selecto = Selecto.configure(snowflake_domain, config.repo)
+snowflake_join = Selecto.joins(snowflake_selecto)[:customer]
+
+snowflake_query =
+  snowflake_selecto
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(5)
+
+{snowflake_sql, snowflake_params} = Selecto.to_sql(snowflake_query)
+IO.puts("Snowflake marker SQL:\n#{snowflake_sql}")
+IO.puts("\nParams: #{inspect(snowflake_params)}")
+IO.puts("Join metadata marker: #{inspect(snowflake_join.join_type)}")
+
+case SelectoExamples.LivebookHelpers.execute_with_checks(snowflake_query, example: "Snowflake join_type Query") do
+  {:ok, {rows, columns, _aliases}} ->
+    IO.puts("\nSnowflake-marked customer aggregates:")
+    IO.puts("Columns: #{inspect(columns)}")
+    Enum.each(rows, fn [customer_name, order_count, total_revenue] ->
+      IO.puts("  #{customer_name}: orders=#{order_count}, total=$#{Decimal.round(total_revenue || Decimal.new(0), 2)}")
+    end)
+
+  {:error, error} ->
+    IO.puts("Execution error: #{inspect(error)}")
+end
+```
+
+Expected output checks (`:snowflake_dimension` marker):
+
+* Join metadata includes the snowflake join marker
+* Query API remains unchanged (`select/group_by/order_by` still works)
+* SQL remains parameterized and executable
+
+## Section 38: Experimental Subfilter Modules (Preview)
+
+### Inspect Availability of Subfilter Components
+
+Business question: Which subfilter modules are present today for teams evaluating experimental subfilter workflows?
+
+```elixir
+subfilter_modules = [
+  Selecto.Subfilter,
+  Selecto.Subfilter.Parser,
+  Selecto.Subfilter.Registry,
+  Selecto.Subfilter.SQL
+]
+
+IO.puts("Subfilter module availability:")
+Enum.each(subfilter_modules, fn mod ->
+  IO.puts("  #{inspect(mod)} loaded? #{Code.ensure_loaded?(mod)}")
+end)
+
+IO.puts("\nNote: Advanced subfilter workflows are currently marked experimental in Selecto.")
+```
+
+Expected output checks (Subfilter Preview):
+
+* Core subfilter modules are discoverable and loadable
+* Teams can evaluate module surface area before adopting advanced subfilter flows
+* Experimental status is explicit in guide narrative
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -2895,5 +3189,11 @@ This Livebook has demonstrated the core features of Selecto:
 30. **Explicit `on:` Joins** - Define custom join predicates with `join/3`
 31. **Advanced Formats** - Use `{:typed_maps, ...}` and `{:stream, ...}` execution formats
 32. **Domain-Level Join Patterns** - Configure OLAP and hierarchical intent via `join_type`
+33. **Introspection Helpers** - Inspect domain/query metadata and resolve fields dynamically
+34. **Type Helpers** - Infer expression types and validate compatibility
+35. **SQL Builder API** - Compare `gen_sql/2` alias metadata with `to_sql/1`
+36. **Advanced Filters** - Use subquery and full-text-search filter operators
+37. **Snowflake Marker Example** - Apply `:snowflake_dimension` without changing query shape
+38. **Subfilter Module Preview** - Inspect experimental subfilter components
 
 For more advanced feature updates, follow the `selecto` repository directly.
