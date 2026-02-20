@@ -23,7 +23,7 @@ defmodule SelectoExamples.MixProject do
     [
       {:ecto_sql, "~> 3.11"},
       {:postgrex, "~> 0.17"},
-      {:selecto, path: "../../selecto"},
+      {:selecto, github: "seeken/selecto", branch: "main"},
       {:jason, "~> 1.4"},
       {:decimal, "~> 2.0"}
     ]

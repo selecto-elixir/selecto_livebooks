@@ -2,7 +2,7 @@
 
 ```elixir
 Mix.install([
-  {:selecto, path: Path.expand("../../../selecto", __DIR__)},
+  {:selecto, github: "seeken/selecto", branch: "main"},
   {:postgrex, "~> 0.17"},
   {:ecto_sql, "~> 3.11"},
   {:jason, "~> 1.4"},
