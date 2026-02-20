@@ -1,13 +1,48 @@
 # Selecto Guide - Interactive Examples
 
 ```elixir
+find_local_selecto = fn ->
+  cwd = File.cwd!()
+  ancestors = [cwd | Path.split(cwd) |> Enum.scan("/", &Path.join(&2, &1)) |> Enum.reverse()]
+
+  candidate_paths =
+    ancestors
+    |> Enum.flat_map(fn base ->
+      [
+        Path.join(base, "vendor/selecto"),
+        Path.join(base, "selecto")
+      ]
+    end)
+    |> Enum.uniq()
+
+  Enum.find(candidate_paths, &(File.exists?(Path.join(&1, "mix.exs"))))
+end
+
+local_selecto_path = find_local_selecto.()
+
+selecto_dep =
+  if local_selecto_path do
+    {:selecto, path: local_selecto_path}
+  else
+    {:selecto, github: "seeken/selecto", branch: "main"}
+  end
+
 Mix.install([
-  {:selecto, github: "seeken/selecto", branch: "main"},
+  selecto_dep,
   {:postgrex, "~> 0.17"},
   {:ecto_sql, "~> 3.11"},
   {:jason, "~> 1.4"},
   {:kino, "~> 0.12"}
 ])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+
+if match?({:selecto, github: _, branch: _}, selecto_dep) do
+  IO.puts("""
+  WARNING: using GitHub Selecto fallback.
+  Hierarchy join examples may fail if the selected branch does not include legacy CTE compatibility.
+  """)
+end
 ```
 
 ## Introduction
@@ -3153,6 +3188,218 @@ Expected output checks (Subfilter Preview):
 * Teams can evaluate module surface area before adopting advanced subfilter flows
 * Experimental status is explicit in guide narrative
 
+## Section 39: Side-by-Side Join SQL Comparison (`:left` vs `:star_dimension` vs `:snowflake_dimension`)
+
+### Compare Join Intent Using the Same Base Query
+
+Business question: What changes in generated SQL and metadata when we switch only join intent?
+
+```elixir
+base_customer_join = config.order_domain.joins.customer
+
+regular_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.put(:type, :left)
+  )
+
+star_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{
+      type: :star_dimension,
+      display_field: :name
+    })
+  )
+
+snowflake_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+build_query = fn selecto ->
+  selecto
+  |> Selecto.select(["order_number", "customer.name", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(3)
+end
+
+Enum.each(
+  [
+    {"Regular (:left)", regular_domain},
+    {"Star (:star_dimension)", star_domain},
+    {"Snowflake (:snowflake_dimension)", snowflake_domain}
+  ],
+  fn {label, domain} ->
+    selecto = Selecto.configure(domain, config.repo)
+    query = build_query.(selecto)
+    {sql, params} = Selecto.to_sql(query)
+    join_meta = Selecto.joins(selecto)[:customer]
+    join_type = Map.get(join_meta, :join_type, :basic)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts("join_type metadata: #{inspect(join_type)}")
+    IO.puts(sql)
+    IO.puts("params: #{inspect(params)}")
+  end
+)
+```
+
+Expected output checks (Join Syntax Comparison):
+
+* Regular join shows a single customer join and basic join metadata
+* Star join preserves one-hop join shape but marks join metadata as `:star_dimension`
+* Snowflake join adds at least one extra normalization-chain join
+
+## Section 40: Hierarchical Join Type Examples (`:adjacency_list`, `:materialized_path`, `:closure_table`)
+
+### Preview Hierarchical Join Metadata and Generated Field Surfaces
+
+Business question: How do the three hierarchical join types differ at configuration-time in Selecto?
+
+```elixir
+hierarchy_base =
+  config.employee_domain
+  |> put_in([:source, :associations, :manager_tree], %{
+    field: :manager_tree,
+    queryable: :employees,
+    owner_key: :manager_id,
+    related_key: :id
+  })
+
+hierarchy_variants = [
+  {
+    :adjacency_list,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :adjacency_list,
+      depth_limit: 5,
+      id_field: :id,
+      parent_field: :manager_id,
+      name_field: :first_name,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :materialized_path,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :materialized_path,
+      path_field: :manager_path,
+      path_separator: "/",
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :closure_table,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :closure_table,
+      closure_table: "employee_closure",
+      ancestor_field: :ancestor_id,
+      descendant_field: :descendant_id,
+      depth_field: :depth,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  }
+]
+
+Enum.each(hierarchy_variants, fn {label, join_config} ->
+  domain = put_in(hierarchy_base, [:joins, :manager_tree], join_config)
+  selecto = Selecto.configure(domain, config.repo)
+  join_meta = Selecto.joins(selecto)[:manager_tree]
+
+  hierarchy_fields =
+    selecto
+    |> Selecto.columns()
+    |> Map.keys()
+    |> Enum.filter(&String.contains?(&1, "manager_tree"))
+    |> Enum.sort()
+    |> Enum.take(12)
+
+  IO.puts("\n=== #{label} ===")
+  IO.puts("join_type: #{inspect(join_meta.join_type)}")
+  IO.puts("hierarchy_depth: #{inspect(Map.get(join_meta, :hierarchy_depth))}")
+  IO.puts("path_field: #{inspect(Map.get(join_meta, :path_field))}")
+  IO.puts("closure_table: #{inspect(Map.get(join_meta, :closure_table))}")
+  IO.puts("field preview: #{inspect(hierarchy_fields)}")
+end)
+```
+
+### Execute a Hierarchy Query (`:adjacency_list`)
+
+Business question: Can the hierarchy join intent produce a runnable SQL query for employee-manager traversal?
+
+```elixir
+adjacency_domain =
+  hierarchy_base
+  |> put_in([:joins, :manager_tree], %{
+    name: "Manager Tree",
+    type: :hierarchical,
+    hierarchy_type: :adjacency_list,
+    depth_limit: 5,
+    id_field: :id,
+    parent_field: :manager_id,
+    name_field: :first_name,
+    fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+  })
+
+adjacency_query =
+  Selecto.configure(adjacency_domain, config.repo)
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_tree.first_name",
+    "manager_tree_level",
+    "manager_tree_path"
+  ])
+  |> Selecto.limit(15)
+
+try do
+  {sql, params} = Selecto.to_sql(adjacency_query)
+  IO.puts("Adjacency hierarchy SQL:\n")
+  IO.puts(sql)
+  IO.puts("\nparams: #{inspect(params)}")
+
+  case SelectoExamples.LivebookHelpers.execute_with_checks(adjacency_query, example: "Adjacency Hierarchy Query") do
+    {:ok, {rows, columns, _aliases}} ->
+      IO.puts("\nAdjacency hierarchy rows:")
+      IO.puts("Columns: #{inspect(columns)}")
+
+      rows
+      |> Enum.take(10)
+      |> Enum.each(&IO.inspect/1)
+
+    {:error, error} ->
+      IO.puts("Execution error: #{inspect(error)}")
+  end
+rescue
+  e ->
+    IO.puts("Hierarchy query generation is unavailable in this Selecto build:")
+    IO.puts(Exception.message(e))
+    IO.puts("Tip: use local `vendor/selecto` or update to a build with hierarchy CTE compatibility fixes.")
+end
+```
+
+Expected output checks (Hierarchical Join Types + Runtime):
+
+* `:adjacency_list` resolves to join metadata `:hierarchical_adjacency` and includes path/level helper fields
+* `:materialized_path` resolves to `:hierarchical_materialized_path` and includes path/depth helper fields
+* `:closure_table` resolves to `:hierarchical_closure_table` and includes depth/descendant helper fields
+* Adjacency runtime query emits `WITH RECURSIVE ...` and returns rows (or prints a compatibility note when running against an older `selecto` build)
+* `:materialized_path` and `:closure_table` metadata can be previewed without adding `manager_path` / `employee_closure` schema objects to the sample DB
+
 ## Conclusion
 
 This Livebook has demonstrated the core features of Selecto:
@@ -3195,5 +3442,7 @@ This Livebook has demonstrated the core features of Selecto:
 36. **Advanced Filters** - Use subquery and full-text-search filter operators
 37. **Snowflake Marker Example** - Apply `:snowflake_dimension` without changing query shape
 38. **Subfilter Module Preview** - Inspect experimental subfilter components
+39. **Join Syntax Comparison** - Compare regular, star, and snowflake SQL side-by-side
+40. **Hierarchical Join Type Examples** - Compare adjacency-list, materialized-path, and closure-table join metadata
 
 For more advanced feature updates, follow the `selecto` repository directly.
