@@ -21,11 +21,12 @@ end
 local_selecto_path = find_local_package.("selecto")
 local_updato_path = find_local_package.("selecto_updato")
 
+# `selecto_updato` declares `{:selecto, path: "../selecto"}`; force one source of truth here.
 selecto_dep =
   if local_selecto_path do
-    {:selecto, path: local_selecto_path}
+    {:selecto, path: local_selecto_path, override: true}
   else
-    {:selecto, github: "seeken/selecto", branch: "main"}
+    {:selecto, github: "seeken/selecto", branch: "main", override: true}
   end
 
 updato_dep =
@@ -56,16 +57,16 @@ This notebook exercises the full public `SelectoUpdato` API against the
 
 Feature coverage checklist:
 
-- `new/2`, `insert/2`, `insert_all/2`, `insert_from_query/2`
-- `update/2` with expression tuples and grouped filters
-- `upsert/2`, `upsert_all/2`, `conflict_target/2`, `on_conflict/2`
-- `delete/1`, `soft_delete/1`, `confirm_bulk_delete/2`, `cascade/3`
-- `nested_strategy/3` for nested updates
-- `filter/2`, `filters/2`, `filter_from_selecto/2`
-- `returning/2`, `with_changeset/2`, `audit/2`
-- `execute/3`, `execute_in_transaction/3`, `transaction/3`
-- `multi/0`, `multi_insert/4`, `multi_insert_all/4`, `multi_update/4`, `multi_delete/4`, `multi_run/3`, `run/3`
-- `dry_run/2`, `to_sql/1`
+* `new/2`, `insert/2`, `insert_all/2`, `insert_from_query/2`
+* `update/2` with expression tuples and grouped filters
+* `upsert/2`, `upsert_all/2`, `conflict_target/2`, `on_conflict/2`
+* `delete/1`, `soft_delete/1`, `confirm_bulk_delete/2`, `cascade/3`
+* `nested_strategy/3` for nested updates
+* `filter/2`, `filters/2`, `filter_from_selecto/2`
+* `returning/2`, `with_changeset/2`, `audit/2`
+* `execute/3`, `execute_in_transaction/3`, `transaction/3`
+* `multi/0`, `multi_insert/4`, `multi_insert_all/4`, `multi_update/4`, `multi_delete/4`, `multi_run/3`, `run/3`
+* `dry_run/2`, `to_sql/1`
 
 Before running this notebook:
 
@@ -395,6 +396,13 @@ alias SelectoUpdatoLivebook.{
 d = &Decimal.new/1
 
 read_key = fn
+  %_{} = struct, key ->
+    wanted = to_string(key)
+
+    struct
+    |> Map.from_struct()
+    |> Enum.find_value(fn {k, v} -> if to_string(k) == wanted, do: v end)
+
   %{} = map, key ->
     wanted = to_string(key)
     Enum.find_value(map, fn {k, v} -> if to_string(k) == wanted, do: v end)
@@ -638,7 +646,10 @@ base_customer_id = read_key.(base_customer, :id)
   |> SelectoUpdato.returning(["id", "sku", "name", "price"])
   |> SelectoUpdato.execute(Repo)
 
-product_rows = Map.get(inserted_products, :records, [])
+product_rows =
+  inserted_products
+  |> Map.get(:records, inserted_products)
+  |> List.wrap()
 
 product_one_id =
   case Enum.at(product_rows, 0) do
@@ -780,25 +791,25 @@ audit_rows =
     ]}
   ])
   |> SelectoUpdato.update(%{
-    "stock_quantity" => {:increment, 5},
-    "price" => {:decrement, d.("1.00")},
-    "reorder_level" => {:set, 3},
-    "tags" => {:array_append, "promo"},
-    "metadata" => {:json_merge, %{"campaign" => run_id}},
-    "description" => {:coalesce, "description filled by coalesce"}
+    stock_quantity: {:increment, 5},
+    price: {:decrement, d.("1.00")},
+    reorder_level: {:set, 3},
+    tags: {:array_append, "promo"},
+    metadata: {:json_merge, %{"campaign" => run_id}},
+    description: {:coalesce, "description filled by coalesce"}
   })
   |> SelectoUpdato.execute(Repo)
 
 {:ok, _prepend_tags} =
   SelectoUpdato.new(product_domain)
   |> SelectoUpdato.filter({"id", product_one_id})
-  |> SelectoUpdato.update(%{"tags" => {:array_prepend, "first-tag"}})
+  |> SelectoUpdato.update(%{tags: {:array_prepend, "first-tag"}})
   |> SelectoUpdato.execute(Repo)
 
 {:ok, _remove_tags} =
   SelectoUpdato.new(product_domain)
   |> SelectoUpdato.filter({"id", product_one_id})
-  |> SelectoUpdato.update(%{"tags" => {:array_remove, "promo"}})
+  |> SelectoUpdato.update(%{tags: {:array_remove, "promo"}})
   |> SelectoUpdato.execute(Repo)
 
 {:ok, nested_update_result} =
@@ -806,7 +817,6 @@ audit_rows =
   |> SelectoUpdato.filter({"id", order.id})
   |> SelectoUpdato.update(%{
     "status" => "processing",
-    "shipping" => {:increment, d.("2.00")},
     "order_items" => [
       %{
         "id" => first_order_item.id,
@@ -825,7 +835,8 @@ audit_rows =
         "line_total" => d.("12.34"),
         "line_number" => 2
       }
-    ]
+    ],
+    "shipping" => Decimal.add(order.shipping || d.("0.00"), d.("2.00"))
   })
   |> SelectoUpdato.nested_strategy(:order_items, :sync)
   |> SelectoUpdato.execute(Repo)
@@ -850,7 +861,7 @@ dry_run_insert_error =
 dry_run_update_ok =
   SelectoUpdato.new(product_domain)
   |> SelectoUpdato.filter({"id", product_one_id})
-  |> SelectoUpdato.update(%{"stock_quantity" => {:increment, 2}})
+  |> SelectoUpdato.update(%{stock_quantity: {:increment, 2}})
   |> SelectoUpdato.dry_run(Repo)
 
 dry_run_update_missing_filter =
@@ -925,9 +936,40 @@ snapshot_filter_query =
   |> Selecto.filter({"order_number", {:ilike, "#{run_id}%"}})
   |> Selecto.filter({"status", "processing"})
 
-{:ok, filter_from_selecto_result} =
+extract_selecto_filters = fn selecto_query ->
+  legacy_filters = Map.get(selecto_query, :filters, [])
+
+  selecto_set =
+    case Map.get(selecto_query, :set) do
+      %{} = set -> set
+      _ -> %{}
+    end
+
+  set_filters = Map.get(selecto_set, :filtered) || Map.get(selecto_set, :filters) || []
+  post_pivot_filters = Map.get(selecto_set, :post_pivot_filters) || []
+
+  [legacy_filters, set_filters, post_pivot_filters]
+  |> Enum.flat_map(fn
+    filters when is_list(filters) -> filters
+    _ -> []
+  end)
+end
+
+snapshot_filters = extract_selecto_filters.(snapshot_filter_query)
+
+snapshot_update_op =
   SelectoUpdato.new(order_snapshot_domain)
   |> SelectoUpdato.filter_from_selecto(snapshot_filter_query)
+
+snapshot_update_op =
+  if snapshot_update_op.filters == [] do
+    SelectoUpdato.filters(snapshot_update_op, snapshot_filters)
+  else
+    snapshot_update_op
+  end
+
+{:ok, filter_from_selecto_result} =
+  snapshot_update_op
   |> SelectoUpdato.update(%{"status" => "copied"})
   |> SelectoUpdato.execute(Repo)
 
