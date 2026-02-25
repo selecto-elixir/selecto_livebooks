@@ -9,7 +9,9 @@ queries interactively.
 - Ecto schemas for products, orders, customers, employees, tags, and reviews
 - Migrations and seed data
 - Domain modules for Selecto examples
-- Livebook notebook under `livebooks/selecto_guide_examples.livemd`
+- Livebook notebooks under:
+  - `livebooks/selecto_guide_examples.livemd`
+  - `livebooks/selecto_updato_feature_tour.livemd`
 
 ## Requirements
 
@@ -47,6 +49,10 @@ livebook server
 Then open:
 
 `selecto_examples/livebooks/selecto_guide_examples.livemd`
+
+or:
+
+`selecto_examples/livebooks/selecto_updato_feature_tour.livemd`
 
 ## Notes
 

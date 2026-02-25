@@ -8,6 +8,8 @@ It includes:
 - `selecto_examples/` - an Ecto app with schemas, migrations, and seed data
 - `selecto_examples/livebooks/selecto_guide_examples.livemd` - an interactive
   end-to-end guide covering core and advanced Selecto features
+- `selecto_examples/livebooks/selecto_updato_feature_tour.livemd` - a
+  full write-path tour covering the complete SelectoUpdato public API
 
 ## What This Repo Does
 
