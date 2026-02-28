@@ -1,0 +1,343 @@
+# Selecto Output Formats and Execution Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook focuses on execution-time output options and runtime metadata.
+
+1. Standard execution (`execute/2`) with `rows/columns/aliases`
+2. Rich metadata (`execute_with_metadata/2`)
+3. Single-row contract (`execute_one/2`)
+4. Built-in output formats (`:maps`, `:json`, `:csv`)
+5. Advanced formats (`:typed_maps`, `:stream`)
+
+```mermaid
+flowchart LR
+  query[Selecto query]
+  exec[execute / execute_with_metadata / execute_one]
+  format[format option]
+  result[result payload]
+
+  query --> exec --> result
+  query --> format --> result
+```
+
+```mermaid
+graph TD
+  raw[raw tuple rows]
+  maps[maps]
+  json[json string]
+  csv[csv text]
+  stream[lazy stream]
+
+  raw --> maps
+  raw --> json
+  raw --> csv
+  raw --> stream
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Domains
+
+This cell defines a local Repo plus minimal product and order domains.
+
+```elixir
+defmodule OutputLab.Repo do
+  use Ecto.Repo,
+    otp_app: :output_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule OutputLab.Domains do
+  @moduledoc false
+
+  def product_domain do
+    %{
+      name: "Products",
+      source: %{
+        source_table: "products",
+        primary_key: :id,
+        fields: [:id, :name, :sku, :price, :active, :inserted_at],
+        columns: %{
+          id: %{type: :integer},
+          name: %{type: :string},
+          sku: %{type: :string},
+          price: %{type: :decimal},
+          active: %{type: :boolean},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["name", "sku", "price"],
+      default_order_by: [{"name", :asc}]
+    }
+  end
+
+  def order_domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [:id, :order_number, :status, :total, :inserted_at],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["order_number", "status", "total"],
+      default_order_by: [{"total", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(OutputLab.Repo) do
+  nil -> {:ok, _pid} = OutputLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: OutputLab.Repo,
+  product_domain: OutputLab.Domains.product_domain(),
+  order_domain: OutputLab.Domains.order_domain()
+}
+
+{:ok, p_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from products", [])
+{:ok, o_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+[[product_count]] = p_result.rows
+[[order_count]] = o_result.rows
+IO.puts("Connected. Products: #{product_count}, Orders: #{order_count}")
+
+config
+```
+
+## Setup 3) Define Helper
+
+This helper prints SQL and parameters once for each query.
+
+```elixir
+defmodule OutputLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+end
+```
+
+## 1) Baseline `execute/2` (Raw Tuple Output)
+
+`execute/2` returns `{:ok, {rows, columns, aliases}}` by default.
+
+```elixir
+raw_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(5)
+
+OutputLab.Helpers.explain("Raw execute/2", raw_query)
+
+case Selecto.execute(raw_query) do
+  {:ok, {rows, columns, aliases}} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.puts("Aliases: #{inspect(aliases)}")
+    IO.inspect(rows, label: "Rows")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 2) `execute_with_metadata/2`
+
+Get result data plus metadata like SQL text, params, and execution time.
+
+```elixir
+metadata_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(3)
+
+OutputLab.Helpers.explain("execute_with_metadata/2", metadata_query)
+
+case Selecto.execute_with_metadata(metadata_query) do
+  {:ok, {rows, columns, _aliases}, metadata} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.inspect(rows, label: "Rows")
+    IO.puts("Metadata keys: #{inspect(Map.keys(metadata))}")
+    IO.puts("Execution time (ms): #{inspect(metadata[:execution_time])}")
+    IO.puts("Metadata params: #{inspect(metadata[:params])}")
+    IO.puts("Metadata SQL:\n#{metadata[:sql]}")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 3) `execute_one/2` Success and Guard Behavior
+
+`execute_one/2` enforces exactly one row.
+
+```elixir
+one_row_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(1)
+
+many_rows_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.limit(2)
+
+OutputLab.Helpers.explain("execute_one/2 success case", one_row_query)
+
+case Selecto.execute_one(one_row_query) do
+  {:ok, {row, aliases}} ->
+    IO.puts("Single row: #{inspect(row)}")
+    IO.puts("Aliases: #{inspect(aliases)}")
+
+  {:error, error} ->
+    IO.puts("Unexpected error: #{inspect(error)}")
+end
+
+OutputLab.Helpers.explain("execute_one/2 guard case", many_rows_query)
+
+case Selecto.execute_one(many_rows_query) do
+  {:ok, {row, _aliases}} ->
+    IO.puts("Unexpected single row: #{inspect(row)}")
+
+  {:error, error} ->
+    IO.puts("Expected guard error: #{inspect(error)}")
+end
+```
+
+## 4) Built-in Output Formats (`:maps`, `:json`, `:csv`)
+
+Switch `format` at execution time to get payloads ready for APIs or exports.
+
+```elixir
+format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(5)
+
+OutputLab.Helpers.explain("Formatted output query", format_query)
+
+IO.puts("\nFormat :maps")
+case Selecto.execute(format_query, format: :maps) do
+  {:ok, maps} -> IO.inspect(maps, label: "maps")
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat {:json, [pretty: true]}")
+case Selecto.execute(format_query, format: {:json, [pretty: true]}) do
+  {:ok, json_string} -> IO.puts(json_string)
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat :csv")
+case Selecto.execute(format_query, format: :csv) do
+  {:ok, csv_string} -> IO.puts(csv_string)
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 5) Advanced Formats (`:typed_maps`, `:stream`)
+
+Use type-coerced maps and lazy streaming for larger processing pipelines.
+
+```elixir
+advanced_format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "price", "active"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(10)
+
+OutputLab.Helpers.explain("Advanced format query", advanced_format_query)
+
+IO.puts("\nFormat {:typed_maps, [keys: :strings, coerce: :safe]}")
+case Selecto.execute(advanced_format_query, format: {:typed_maps, [keys: :strings, coerce: :safe]}) do
+  {:ok, typed_maps} ->
+    typed_maps
+    |> Enum.take(5)
+    |> IO.inspect(label: "typed_maps preview")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat {:stream, :maps}")
+case Selecto.execute(advanced_format_query, format: {:stream, :maps}) do
+  {:ok, row_stream} ->
+    row_stream
+    |> Enum.take(5)
+    |> IO.inspect(label: "stream preview")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. Benchmarks comparing `:maps` vs `:typed_maps` overhead for larger result sets
+2. A section writing CSV output directly to disk for export workflows
+3. A stream-processing section folding results into aggregate statistics in Elixir

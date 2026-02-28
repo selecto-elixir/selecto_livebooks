@@ -1,0 +1,272 @@
+# Selecto CASE Expressions Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook focuses on SQL `CASE` projections generated through Selecto.
+
+1. `case_when_select/3` for condition-driven buckets
+2. `case_select/4` for value-to-label mapping
+3. Combining CASE output with sorting and limits
+
+```mermaid
+flowchart LR
+  row[Order row]
+  conditions[CASE conditions]
+  label[Computed label]
+  output[Row + label column]
+
+  row --> conditions --> label --> output
+```
+
+```mermaid
+graph TD
+  total[order total]
+  high[high_value]
+  medium[medium_value]
+  low[low_value]
+
+  total -->|>= 1000| high
+  total -->|>= 500| medium
+  total -->|< 500| low
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Order Domain
+
+This cell defines a local Repo and order-focused domain for CASE examples.
+
+```elixir
+defmodule CaseLab.Repo do
+  use Ecto.Repo,
+    otp_app: :case_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule CaseLab.OrderDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [
+          :id,
+          :order_number,
+          :status,
+          :total,
+          :shipping_country,
+          :inserted_at,
+          :customer_id
+        ],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          shipping_country: %{type: :string},
+          inserted_at: %{type: :utc_datetime},
+          customer_id: %{type: :integer}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["order_number", "status", "total", "shipping_country"],
+      default_order_by: [{"total", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(CaseLab.Repo) do
+  nil -> {:ok, _pid} = CaseLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: CaseLab.Repo,
+  order_domain: CaseLab.OrderDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+[[order_count]] = result.rows
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+## Setup 3) Define CASE Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule CaseLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Conditional Buckets with `case_when_select/3`
+
+Classify each order by monetary threshold into `high_value`, `medium_value`, or `low_value`.
+
+```elixir
+size_bucket_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.case_when_select([
+    {[{"total", {:>=, Decimal.new("1000")}}], "high_value"},
+    {[{"total", {:>=, Decimal.new("500")}}], "medium_value"},
+    {[{"total", {:<, Decimal.new("500")}}], "low_value"}
+  ], else: "unknown", as: "order_size")
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(15)
+
+CaseLab.Helpers.run("CASE WHEN bucket by total", size_bucket_query)
+```
+
+## 2) Value Mapping with `case_select/4`
+
+Map raw `status` values into simplified workflow buckets.
+
+```elixir
+status_bucket_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.case_select("status", [
+    {"processing", "Open"},
+    {"shipped", "In Transit"},
+    {"delivered", "Closed"},
+    {"cancelled", "Closed"}
+  ], else: "Other", as: "status_bucket")
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(15)
+
+CaseLab.Helpers.run("Simple CASE status mapping", status_bucket_query)
+```
+
+## 3) CASE + Filtering + Sorting
+
+Combine CASE output with additional relational filters to focus on high-value operational views.
+
+```elixir
+focused_case_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total", "shipping_country"])
+  |> Selecto.case_when_select([
+    {[{"total", {:>=, Decimal.new("1000")}}], "priority"},
+    {[{"total", {:>=, Decimal.new("500")}}], "standard"},
+    {[{"total", {:<, Decimal.new("500")}}], "light"}
+  ], else: "other", as: "value_tier")
+  |> Selecto.filter({"status", {:in, ["processing", "shipped", "delivered"]}})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(20)
+
+CaseLab.Helpers.run("CASE tiers with operational filter", focused_case_query)
+```
+
+## 4) Side-by-Side CASE Strategy Comparison
+
+Run two queries (conditional case vs simple case) to compare generated SQL and output semantics.
+
+```elixir
+comparison_queries = [
+  {
+    "Conditional CASE",
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["order_number", "status", "total"])
+    |> Selecto.case_when_select([
+      {[{"total", {:>=, Decimal.new("1000")}}], "high_value"},
+      {[{"total", {:>=, Decimal.new("500")}}], "medium_value"},
+      {[{"total", {:<, Decimal.new("500")}}], "low_value"}
+    ], else: "unknown", as: "bucket")
+    |> Selecto.limit(8)
+  },
+  {
+    "Simple CASE",
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["order_number", "status", "total"])
+    |> Selecto.case_select("status", [
+      {"processing", "Open"},
+      {"shipped", "In Transit"},
+      {"delivered", "Closed"},
+      {"cancelled", "Closed"}
+    ], else: "Other", as: "bucket")
+    |> Selecto.limit(8)
+  }
+]
+
+Enum.each(comparison_queries, fn {label, query} ->
+  CaseLab.Helpers.run(label, query, 5)
+end)
+
+:ok
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. CASE expressions combined with window functions for ranked bucketing
+2. Aggregate reports grouped by CASE-derived tier fields
+3. `select_shape/2` projections with nested CASE outputs

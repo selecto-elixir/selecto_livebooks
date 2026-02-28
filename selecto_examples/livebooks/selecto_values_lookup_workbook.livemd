@@ -1,0 +1,308 @@
+# Selecto VALUES and Inline Lookup Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook demonstrates `with_values/3` for inline lookup tables and ad hoc reference data.
+
+1. Add a literal lookup table using row lists
+2. Join inline lookup to base query rows
+3. Use map rows with inferred columns
+4. Treat VALUES tables as priority metadata without physical schema changes
+
+```mermaid
+flowchart LR
+  base[orders]
+  values[WITH ... VALUES inline table]
+  join[join inline table]
+  select[select mapped fields]
+  output[result rows]
+
+  base --> join
+  values --> join --> select --> output
+```
+
+```mermaid
+graph TD
+  status[order status]
+  labels[status_labels VALUES]
+  priority[priority VALUES]
+
+  status --> labels
+  status --> priority
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Order Domain
+
+This cell defines a local Repo and order domain for VALUES join examples.
+
+```elixir
+defmodule ValuesLab.Repo do
+  use Ecto.Repo,
+    otp_app: :values_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule ValuesLab.OrderDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [
+          :id,
+          :order_number,
+          :status,
+          :total,
+          :shipping_country,
+          :inserted_at,
+          :customer_id
+        ],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          shipping_country: %{type: :string},
+          inserted_at: %{type: :utc_datetime},
+          customer_id: %{type: :integer}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["order_number", "status", "total"],
+      default_order_by: [{"total", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(ValuesLab.Repo) do
+  nil -> {:ok, _pid} = ValuesLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: ValuesLab.Repo,
+  order_domain: ValuesLab.OrderDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+[[order_count]] = result.rows
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+## Setup 3) Define VALUES Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule ValuesLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Basic Inline Status Label Mapping
+
+Define a small status-to-label table inline and join it to orders.
+
+```elixir
+status_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      ["processing", "In Progress"],
+      ["shipped", "In Transit"],
+      ["delivered", "Completed"],
+      ["cancelled", "Cancelled"]
+    ],
+    columns: ["status", "status_label"],
+    as: "status_labels"
+  )
+  |> Selecto.join(:status_labels,
+    source: "status_labels",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      status_label: %{type: :string}
+    }
+  )
+  |> Selecto.select(["order_number", "status", "status_labels.status_label", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("Inline status labels", status_lookup_query)
+```
+
+## 2) Map-Row VALUES with Inferred Columns
+
+Provide values as maps and let Selecto infer the columns.
+
+```elixir
+status_priority_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", priority_rank: 3, customer_label: "Open"},
+      %{status: "shipped", priority_rank: 2, customer_label: "On The Way"},
+      %{status: "delivered", priority_rank: 1, customer_label: "Complete"},
+      %{status: "cancelled", priority_rank: 4, customer_label: "Cancelled"}
+    ],
+    as: "status_priority"
+  )
+  |> Selecto.join(:status_priority,
+    source: "status_priority",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      priority_rank: %{type: :integer},
+      customer_label: %{type: :string}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "status_priority.priority_rank",
+    "status_priority.customer_label",
+    "total"
+  ])
+  |> Selecto.order_by({"status_priority.priority_rank", :asc})
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("Map-row VALUES with inferred columns", status_priority_query)
+```
+
+## 3) Inline Lookup for Shipping Region Buckets
+
+Create an inline table that classifies shipping countries into coarse geographic buckets.
+
+```elixir
+region_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      ["USA", "North America"],
+      ["Canada", "North America"],
+      ["Mexico", "North America"],
+      ["UK", "Europe"],
+      ["Germany", "Europe"],
+      ["France", "Europe"]
+    ],
+    columns: ["shipping_country", "region_bucket"],
+    as: "country_region_map"
+  )
+  |> Selecto.join(:country_region_map,
+    source: "country_region_map",
+    type: :left,
+    owner_key: :shipping_country,
+    related_key: :shipping_country,
+    fields: %{
+      shipping_country: %{type: :string},
+      region_bucket: %{type: :string}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "shipping_country",
+    "country_region_map.region_bucket",
+    "total"
+  ])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(20)
+
+ValuesLab.Helpers.run("Inline country-region lookup", region_lookup_query)
+```
+
+## 4) Compare Two VALUES Strategies Side-by-Side
+
+Run list-row and map-row styles in one pass to compare SQL and output readability.
+
+```elixir
+comparison_queries = [
+  {"List-row VALUES", status_lookup_query},
+  {"Map-row VALUES", status_priority_query}
+]
+
+Enum.each(comparison_queries, fn {label, query} ->
+  ValuesLab.Helpers.run(label, query, 5)
+end)
+
+:ok
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. A section combining `with_values/3` and `with_cte/4` for staged lookup logic
+2. Priority-scored sorting where inline lookup controls business display order
+3. A `select_shape/2` output version for nested lookup payloads

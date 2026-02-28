@@ -1,0 +1,300 @@
+# Selecto Set Operations Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+Set operations combine two compatible query shapes.
+
+1. `union/3` for A ∪ B
+2. `intersect/3` for A ∩ B
+3. `except/3` for A − B
+4. `all: true` variants to keep duplicates
+
+```mermaid
+flowchart LR
+  a[Query A]
+  b[Query B]
+  compat[Same selected columns]
+  setop[UNION / INTERSECT / EXCEPT]
+  out[Combined result set]
+
+  a --> compat
+  b --> compat
+  compat --> setop --> out
+```
+
+```mermaid
+graph TD
+  cohortA[Employees with manager]
+  cohortB[Employees with direct reports]
+  union[UNION: A or B]
+  inter[INTERSECT: A and B]
+  exceptA[EXCEPT: A not B]
+
+  cohortA --> union
+  cohortB --> union
+  cohortA --> inter
+  cohortB --> inter
+  cohortA --> exceptA
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Employee Domain
+
+This cell defines a local Repo and employee domain used to build compatible cohorts.
+
+```elixir
+defmodule SetOpsLab.Repo do
+  use Ecto.Repo,
+    otp_app: :set_ops_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule SetOpsLab.EmployeeDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Employees",
+      source: %{
+        source_table: "employees",
+        primary_key: :id,
+        fields: [:id, :first_name, :last_name, :title, :department, :manager_id, :active],
+        columns: %{
+          id: %{type: :integer},
+          first_name: %{type: :string},
+          last_name: %{type: :string},
+          title: %{type: :string},
+          department: %{type: :string},
+          manager_id: %{type: :integer},
+          active: %{type: :boolean}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["id", "first_name", "last_name", "title"],
+      default_order_by: [{"id", :asc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(SetOpsLab.Repo) do
+  nil -> {:ok, _pid} = SetOpsLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: SetOpsLab.Repo,
+  employee_domain: SetOpsLab.EmployeeDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from employees", [])
+[[employee_count]] = result.rows
+IO.puts("Connected. Employees in dataset: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define Set-Op Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule SetOpsLab.Helpers do
+  @moduledoc false
+
+  def run(label, meaning, query, preview_count \\ 10) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts("Meaning: #{meaning}")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Build Compatible Cohorts
+
+Both cohorts select the same columns so they can participate in set operations.
+
+```elixir
+employees_with_manager =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+  |> Selecto.filter({"manager_id", :not_null})
+
+employees_with_direct_reports =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.join(:direct_report,
+    source: "employees",
+    type: :inner,
+    owner_key: :id,
+    related_key: :manager_id,
+    fields: %{
+      id: %{type: :integer}
+    }
+  )
+  |> Selecto.filter({"direct_report.id", :not_null})
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+  |> Selecto.group_by(["id", "first_name", "last_name", "title"])
+
+:ok
+```
+
+## 2) UNION and UNION ALL
+
+`UNION` de-duplicates; `UNION ALL` keeps duplicates.
+
+```elixir
+union_query =
+  Selecto.union(employees_with_manager, employees_with_direct_reports)
+
+union_all_query =
+  Selecto.union(employees_with_manager, employees_with_direct_reports, all: true)
+
+SetOpsLab.Helpers.run(
+  "UNION",
+  "Employees who either report to someone or manage at least one direct report.",
+  union_query
+)
+
+SetOpsLab.Helpers.run(
+  "UNION ALL",
+  "Same cohorts but keep duplicates (middle managers may appear twice).",
+  union_all_query
+)
+```
+
+## 3) INTERSECT
+
+`INTERSECT` returns employees in both cohorts.
+
+```elixir
+intersect_query =
+  Selecto.intersect(employees_with_manager, employees_with_direct_reports)
+
+SetOpsLab.Helpers.run(
+  "INTERSECT",
+  "Middle managers: employees who report upward and also manage others.",
+  intersect_query
+)
+```
+
+## 4) EXCEPT (Directional)
+
+Direction matters: `A EXCEPT B` is different from `B EXCEPT A`.
+
+```elixir
+except_a_minus_b =
+  Selecto.except(employees_with_manager, employees_with_direct_reports)
+
+except_b_minus_a =
+  Selecto.except(employees_with_direct_reports, employees_with_manager)
+
+SetOpsLab.Helpers.run(
+  "EXCEPT (A - B)",
+  "Employees with managers who do not manage anyone (individual contributors).",
+  except_a_minus_b
+)
+
+SetOpsLab.Helpers.run(
+  "EXCEPT (B - A)",
+  "Employees who manage others but do not report upward (top-level leadership).",
+  except_b_minus_a
+)
+```
+
+## 5) Summary Runner
+
+Run all five comparisons in sequence to inspect SQL and row counts side by side.
+
+```elixir
+set_queries = [
+  {
+    "UNION",
+    "A ∪ B",
+    Selecto.union(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "UNION ALL",
+    "A ∪ B (duplicates kept)",
+    Selecto.union(employees_with_manager, employees_with_direct_reports, all: true)
+  },
+  {
+    "INTERSECT",
+    "A ∩ B",
+    Selecto.intersect(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "EXCEPT (A - B)",
+    "A minus B",
+    Selecto.except(employees_with_manager, employees_with_direct_reports)
+  },
+  {
+    "EXCEPT (B - A)",
+    "B minus A",
+    Selecto.except(employees_with_direct_reports, employees_with_manager)
+  }
+]
+
+Enum.each(set_queries, fn {label, meaning, query} ->
+  SetOpsLab.Helpers.run(label, meaning, query, 5)
+end)
+
+:ok
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. A cross-domain set-op using `column_mapping` for incompatible schemas
+2. Performance comparison between deduplicating and non-deduplicating variants
+3. A section combining set operations with CTEs for staged cohort definitions

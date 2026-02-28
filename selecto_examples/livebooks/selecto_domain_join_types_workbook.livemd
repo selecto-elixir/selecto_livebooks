@@ -1,0 +1,480 @@
+# Selecto Domain Join Types Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook explores advanced domain-level join intent markers.
+
+1. `:star_dimension` for OLAP-like aggregate semantics
+2. `:snowflake_dimension` for normalized dimension chains
+3. Hierarchical markers (`:adjacency_list`, `:materialized_path`, `:closure_table`)
+4. Metadata and SQL differences for the same logical query
+
+```mermaid
+flowchart LR
+  base[Base domain join]
+  marker[Join type marker]
+  planner[Selecto planner]
+  sql[Generated SQL + metadata]
+
+  base --> marker --> planner --> sql
+```
+
+```mermaid
+graph TD
+  fact[orders fact]
+  customer[customer dimension]
+  snow[snowflake normalization]
+  hier[hierarchical join family]
+
+  fact --> customer
+  customer --> snow
+  customer --> hier
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Base Domains
+
+This cell defines base `order_domain` and `employee_domain` for join-type variants.
+
+```elixir
+defmodule JoinTypeLab.Repo do
+  use Ecto.Repo,
+    otp_app: :join_type_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule JoinTypeLab.Domains do
+  @moduledoc false
+
+  def order_domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [:id, :order_number, :status, :total, :customer_id, :inserted_at],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          customer_id: %{type: :integer},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{
+          customer: %{field: :customer, queryable: :customers, owner_key: :customer_id, related_key: :id}
+        }
+      },
+      schemas: %{
+        customers: %{
+          source_table: "customers",
+          primary_key: :id,
+          fields: [:id, :name, :tier, :country, :active],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            name: %{type: :string},
+            tier: %{type: :string},
+            country: %{type: :string},
+            active: %{type: :boolean}
+          }
+        }
+      },
+      joins: %{
+        customer: %{
+          name: "Customer",
+          type: :left,
+          source: "customers",
+          on: [%{left: "customer_id", right: "id"}],
+          fields: %{
+            name: %{type: :string},
+            tier: %{type: :string},
+            country: %{type: :string}
+          }
+        }
+      },
+      default_selected: ["order_number", "status", "total", "customer.name"],
+      default_order_by: [{"total", :desc}]
+    }
+  end
+
+  def employee_domain do
+    %{
+      name: "Employees",
+      source: %{
+        source_table: "employees",
+        primary_key: :id,
+        fields: [:id, :first_name, :last_name, :title, :department, :manager_id, :active],
+        columns: %{
+          id: %{type: :integer},
+          first_name: %{type: :string},
+          last_name: %{type: :string},
+          title: %{type: :string},
+          department: %{type: :string},
+          manager_id: %{type: :integer},
+          active: %{type: :boolean}
+        },
+        associations: %{
+          manager: %{field: :manager, queryable: :employees, owner_key: :manager_id, related_key: :id}
+        }
+      },
+      schemas: %{
+        employees: %{
+          source_table: "employees",
+          primary_key: :id,
+          fields: [:id, :first_name, :last_name, :title, :department, :manager_id, :active],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            first_name: %{type: :string},
+            last_name: %{type: :string},
+            title: %{type: :string},
+            department: %{type: :string},
+            manager_id: %{type: :integer},
+            active: %{type: :boolean}
+          }
+        }
+      },
+      joins: %{
+        manager: %{
+          name: "Manager",
+          type: :left,
+          source: "employees",
+          on: [%{left: "manager_id", right: "id"}],
+          fields: %{
+            first_name: %{type: :string},
+            last_name: %{type: :string}
+          }
+        }
+      }
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(JoinTypeLab.Repo) do
+  nil -> {:ok, _pid} = JoinTypeLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: JoinTypeLab.Repo,
+  order_domain: JoinTypeLab.Domains.order_domain(),
+  employee_domain: JoinTypeLab.Domains.employee_domain()
+}
+
+{:ok, o_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+{:ok, e_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from employees", [])
+[[order_count]] = o_result.rows
+[[employee_count]] = e_result.rows
+IO.puts("Connected. Orders: #{order_count}, Employees: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define Join-Type Helper
+
+This helper prints SQL and optionally executes the query.
+
+```elixir
+defmodule JoinTypeLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) `:star_dimension` Marker
+
+Switch only the customer join type marker and run an aggregate query.
+
+```elixir
+olap_domain =
+  put_in(config.order_domain, [:joins, :customer, :type], :star_dimension)
+
+olap_query =
+  Selecto.configure(olap_domain, config.repo)
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(10)
+
+JoinTypeLab.Helpers.run("Star dimension marker", olap_query)
+```
+
+## 2) `:snowflake_dimension` Marker
+
+Apply the snowflake marker and normalization chain while keeping query API usage unchanged.
+
+```elixir
+snowflake_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    config.order_domain.joins.customer
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+snowflake_selecto = Selecto.configure(snowflake_domain, config.repo)
+snowflake_join = Selecto.joins(snowflake_selecto)[:customer]
+
+snowflake_query =
+  snowflake_selecto
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(10)
+
+IO.puts("Join metadata marker: #{inspect(snowflake_join.join_type)}")
+JoinTypeLab.Helpers.run("Snowflake dimension marker", snowflake_query)
+```
+
+## 3) Side-by-Side Marker Comparison (`:left`, `:star_dimension`, `:snowflake_dimension`)
+
+Keep the same select/filter/order query and compare SQL + metadata by marker only.
+
+```elixir
+base_customer_join = config.order_domain.joins.customer
+
+regular_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.put(:type, :left)
+  )
+
+star_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{type: :star_dimension, display_field: :name})
+  )
+
+snowflake_domain_compare =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+build_query = fn selecto ->
+  selecto
+  |> Selecto.select(["order_number", "customer.name", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(5)
+end
+
+Enum.each(
+  [
+    {"Regular (:left)", regular_domain},
+    {"Star (:star_dimension)", star_domain},
+    {"Snowflake (:snowflake_dimension)", snowflake_domain_compare}
+  ],
+  fn {label, domain} ->
+    selecto = Selecto.configure(domain, config.repo)
+    query = build_query.(selecto)
+    {_sql, _params} = JoinTypeLab.Helpers.explain(label, query)
+    join_meta = Selecto.joins(selecto)[:customer]
+    IO.puts("join_type metadata: #{inspect(Map.get(join_meta, :join_type, :basic))}")
+  end
+)
+
+:ok
+```
+
+## 4) Hierarchical Marker Metadata Preview
+
+Preview metadata and generated field surfaces for three hierarchy styles without requiring all physical schema artifacts.
+
+```elixir
+hierarchy_base =
+  config.employee_domain
+  |> put_in([:source, :associations, :manager_tree], %{
+    field: :manager_tree,
+    queryable: :employees,
+    owner_key: :manager_id,
+    related_key: :id
+  })
+
+hierarchy_variants = [
+  {
+    :adjacency_list,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :adjacency_list,
+      depth_limit: 5,
+      id_field: :id,
+      parent_field: :manager_id,
+      name_field: :first_name,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :materialized_path,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :materialized_path,
+      path_field: :manager_path,
+      path_separator: "/",
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :closure_table,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :closure_table,
+      closure_table: "employee_closure",
+      ancestor_field: :ancestor_id,
+      descendant_field: :descendant_id,
+      depth_field: :depth,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  }
+]
+
+Enum.each(hierarchy_variants, fn {label, join_config} ->
+  domain = put_in(hierarchy_base, [:joins, :manager_tree], join_config)
+
+  try do
+    selecto = Selecto.configure(domain, config.repo, validate: false)
+    join_meta = Selecto.joins(selecto)[:manager_tree]
+
+    hierarchy_fields =
+      selecto
+      |> Selecto.columns()
+      |> Map.keys()
+      |> Enum.filter(&String.contains?(&1, "manager_tree"))
+      |> Enum.sort()
+      |> Enum.take(12)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts("join_type: #{inspect(join_meta.join_type)}")
+    IO.puts("hierarchy_depth: #{inspect(Map.get(join_meta, :hierarchy_depth))}")
+    IO.puts("path_field: #{inspect(Map.get(join_meta, :path_field))}")
+    IO.puts("closure_table: #{inspect(Map.get(join_meta, :closure_table))}")
+    IO.puts("field preview: #{inspect(hierarchy_fields)}")
+  rescue
+    e ->
+      IO.puts("\n=== #{label} ===")
+      IO.puts("Hierarchy preview failed: #{Exception.message(e)}")
+  end
+end)
+
+:ok
+```
+
+## 5) Adjacency Query Attempt (`:adjacency_list`)
+
+Attempt a runnable adjacency hierarchy query and fall back to a compatibility note if unsupported in the current build.
+
+```elixir
+adjacency_domain =
+  hierarchy_base
+  |> put_in([:joins, :manager_tree], %{
+    name: "Manager Tree",
+    type: :hierarchical,
+    hierarchy_type: :adjacency_list,
+    depth_limit: 5,
+    id_field: :id,
+    parent_field: :manager_id,
+    name_field: :first_name,
+    fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+  })
+
+adjacency_query =
+  Selecto.configure(adjacency_domain, config.repo, validate: false)
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_tree.first_name",
+    "manager_tree_level",
+    "manager_tree_path"
+  ])
+  |> Selecto.limit(15)
+
+try do
+  JoinTypeLab.Helpers.run("Adjacency hierarchy runtime", adjacency_query)
+rescue
+  e ->
+    IO.puts("Hierarchy query generation is unavailable in this Selecto build:")
+    IO.puts(Exception.message(e))
+    IO.puts("Tip: use a build with hierarchy CTE compatibility fixes for runtime traversal examples.")
+end
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. A deep-dive on snowflake normalization chains across multiple dimension tables
+2. Benchmark cells comparing generated SQL plans between join markers
+3. A reporting example combining hierarchy markers with window functions

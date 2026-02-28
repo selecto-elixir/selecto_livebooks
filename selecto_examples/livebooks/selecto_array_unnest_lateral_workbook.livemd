@@ -1,0 +1,285 @@
+# Selecto Array, UNNEST, and LATERAL Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook covers array-centric query patterns and row-expansion techniques.
+
+1. Array projections (`array_select`)
+2. Array filtering (`array_filter`)
+3. Array transformations (`array_manipulate`)
+4. `UNNEST` expansion to row-level output
+5. Explicit `LATERAL` joins (subquery/function forms)
+
+```mermaid
+flowchart LR
+  base[Product rows]
+  arr[array columns]
+  arrops[Array operations]
+  unnest[UNNEST or LATERAL expansion]
+  rows[Expanded analytic rows]
+
+  base --> arr --> arrops --> rows
+  arr --> unnest --> rows
+```
+
+```mermaid
+graph TD
+  product[one product row]
+  tags[array of tags]
+  t1[tag row 1]
+  t2[tag row 2]
+  t3[tag row 3]
+
+  product --> tags --> t1
+  product --> tags --> t2
+  product --> tags --> t3
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Product Domain
+
+This cell defines a local Repo and a product domain with `tags` and `metadata` fields.
+
+```elixir
+defmodule ArrayLab.Repo do
+  use Ecto.Repo,
+    otp_app: :array_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule ArrayLab.ProductDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Products",
+      source: %{
+        source_table: "products",
+        primary_key: :id,
+        fields: [
+          :id,
+          :name,
+          :sku,
+          :price,
+          :stock_quantity,
+          :reorder_level,
+          :active,
+          :featured,
+          :tags,
+          :metadata,
+          :inserted_at
+        ],
+        columns: %{
+          id: %{type: :integer},
+          name: %{type: :string},
+          sku: %{type: :string},
+          price: %{type: :decimal},
+          stock_quantity: %{type: :integer},
+          reorder_level: %{type: :integer},
+          active: %{type: :boolean},
+          featured: %{type: :boolean},
+          tags: %{type: {:array, :string}},
+          metadata: %{type: :jsonb},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["name", "sku", "tags"],
+      default_order_by: [{"name", :asc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(ArrayLab.Repo) do
+  nil -> {:ok, _pid} = ArrayLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: ArrayLab.Repo,
+  product_domain: ArrayLab.ProductDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from products", [])
+[[product_count]] = result.rows
+IO.puts("Connected. Products in dataset: #{product_count}")
+
+config
+```
+
+## Setup 3) Define Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule ArrayLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Array Projections and Overlap Filtering
+
+Use `array_select` to derive metrics from `tags` and `array_filter` to keep products whose tags overlap a target set.
+
+```elixir
+array_projection_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "tags"])
+  |> Selecto.array_select([
+    {:array_length, "tags", 1, as: "tag_count"},
+    {:array_to_string, "tags", ", ", as: "tag_list"}
+  ])
+  |> Selecto.array_filter({:array_overlap, "tags", ["electronics", "outdoor"]})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(10)
+
+ArrayLab.Helpers.run("Array projections + overlap filter", array_projection_query)
+```
+
+## 2) Array Transformations with `array_manipulate/3`
+
+Transform arrays in-place for downstream usage without mutating stored data.
+
+```elixir
+array_manipulation_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "tags"])
+  |> Selecto.array_manipulate([
+    {:array_append, "tags", "featured_livebook", [as: "tags_plus_featured"]},
+    {:array_remove, "tags", "outdoor", [as: "tags_without_outdoor"]},
+    {:array_to_string, "tags", " | ", [as: "tags_pipe"]}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.limit(10)
+
+ArrayLab.Helpers.run("Array manipulation", array_manipulation_query)
+```
+
+## 3) Expand Tags with `UNNEST`
+
+`UNNEST` converts each tag value into its own row while preserving the source product context.
+
+```elixir
+unnest_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "name",
+    {:field, {:raw_sql, "product_tag"}, "product_tag"}
+  ])
+  |> Selecto.unnest("tags", as: "product_tag")
+  |> Selecto.filter({"active", true})
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(20)
+
+ArrayLab.Helpers.run("UNNEST tag expansion", unnest_query)
+```
+
+## 4) Explicit LATERAL Join with UNNEST
+
+This uses `lateral_join/5` directly instead of `unnest/2` convenience.
+
+```elixir
+lateral_unnest_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "name",
+    {:field, {:raw_sql, "tag_expanded"}, "product_tag"}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.lateral_join(:inner, {:unnest, "selecto_root.tags"}, "tag_expanded")
+  |> Selecto.order_by({"name", :asc})
+  |> Selecto.limit(20)
+
+ArrayLab.Helpers.run("Explicit lateral unnest", lateral_unnest_query)
+```
+
+## 5) LATERAL Function Form (`generate_series`)
+
+Use lateral function form to generate per-row derived slots from each product id.
+
+```elixir
+generate_series_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select([
+    "id",
+    "name",
+    {:field, {:raw_sql, "period_slot"}, "period_slot"}
+  ])
+  |> Selecto.filter({"active", true})
+  |> Selecto.filter({"id", {:<=, 3}})
+  |> Selecto.lateral_join(:inner, {:function, :generate_series, [1, "selecto_root.id"]}, "period_slot")
+  |> Selecto.order_by({"id", :asc})
+  |> Selecto.limit(20)
+
+ArrayLab.Helpers.run("Lateral generate_series", generate_series_query)
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. Grouped analytics after UNNEST (tag frequency distributions)
+2. A section combining `array_filter` and JSON filters for hybrid conditions
+3. A `select_shape/2` variant showing nested array-derived outputs

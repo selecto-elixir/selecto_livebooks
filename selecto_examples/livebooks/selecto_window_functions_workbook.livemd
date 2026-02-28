@@ -1,0 +1,297 @@
+# Selecto Window Functions Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
+
+```elixir
+selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+```
+
+## Overview
+
+This workbook focuses on analytical window functions that keep row-level detail while adding per-partition metrics.
+
+1. Department ranking with `row_number`
+2. Department average with `avg(...) over (...)`
+3. Running totals with ordered windows
+4. Previous/next comparisons with `lag` and `lead`
+5. Salary banding with `ntile`
+
+```mermaid
+flowchart LR
+  base[Base row selection]
+  partition[Define partition]
+  order[Define order within partition]
+  win[Apply window function]
+  result[Row + analytic columns]
+
+  base --> partition --> order --> win --> result
+```
+
+```mermaid
+graph TD
+  dept[department partition]
+  emp1[employee row]
+  emp2[employee row]
+  emp3[employee row]
+  metric[window metric per row]
+
+  dept --> emp1 --> metric
+  dept --> emp2 --> metric
+  dept --> emp3 --> metric
+```
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Employee Domain
+
+This cell defines a local Repo and an employee-focused domain for window function demos.
+
+```elixir
+defmodule WindowLab.Repo do
+  use Ecto.Repo,
+    otp_app: :window_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule WindowLab.EmployeeDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Employees",
+      source: %{
+        source_table: "employees",
+        primary_key: :id,
+        fields: [
+          :id,
+          :first_name,
+          :last_name,
+          :email,
+          :title,
+          :department,
+          :salary,
+          :hire_date,
+          :active,
+          :manager_id,
+          :inserted_at
+        ],
+        columns: %{
+          id: %{type: :integer},
+          first_name: %{type: :string},
+          last_name: %{type: :string},
+          email: %{type: :string},
+          title: %{type: :string},
+          department: %{type: :string},
+          salary: %{type: :decimal},
+          hire_date: %{type: :date},
+          active: %{type: :boolean},
+          manager_id: %{type: :integer},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["first_name", "last_name", "department", "salary"],
+      default_order_by: [{"department", :asc}, {"salary", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(WindowLab.Repo) do
+  nil -> {:ok, _pid} = WindowLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: WindowLab.Repo,
+  employee_domain: WindowLab.EmployeeDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from employees", [])
+[[employee_count]] = result.rows
+IO.puts("Connected. Employees in dataset: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define Window Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule WindowLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Department Salary Rank + Department Average
+
+This query shows each active employee row and adds two analytics:
+
+1. `department_salary_rank` from highest salary to lowest within each department
+2. `department_avg_salary` repeated on each row for quick comparison
+
+```elixir
+department_rank_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:row_number, [],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "department_salary_rank"
+  )
+  |> Selecto.window_function(:avg, ["salary"],
+    over: [partition_by: ["department"]],
+    as: "department_avg_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Department rank + average", department_rank_query)
+```
+
+## 2) Running Department Payroll by Salary Order
+
+This query adds cumulative payroll at each row inside a department, ordered by salary descending.
+
+```elixir
+running_total_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:sum, ["salary"],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "running_department_payroll"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Running department payroll", running_total_query)
+```
+
+## 3) Previous and Next Salary in the Same Department
+
+`lag` and `lead` let you compare each salary row with nearby rows in the same ordered partition.
+
+```elixir
+neighbor_compare_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:lag, ["salary", 1],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "prev_salary"
+  )
+  |> Selecto.window_function(:lead, ["salary", 1],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "next_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Lag/lead salary neighbors", neighbor_compare_query)
+```
+
+## 4) Salary Quartiles with `ntile`
+
+`ntile(4)` assigns each row into a quartile bucket based on global salary ordering.
+
+```elixir
+quartile_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:ntile, [4],
+    over: [order_by: [{"salary", :desc}]],
+    as: "salary_quartile"
+  )
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(30)
+
+WindowLab.Helpers.run("Global salary quartiles", quartile_query)
+```
+
+## Next Steps
+
+To extend this workbook, add:
+
+1. Percentile-style windows and moving averages using custom SQL functions
+2. A section combining window columns with `select_shape/2` for structured output
+3. A dashboard cell that compares top earners by department and tenure buckets
