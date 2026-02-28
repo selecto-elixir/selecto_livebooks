@@ -27,6 +27,36 @@ This notebook focuses on four related query-building patterns:
 3. Subselects (`Selecto.subselect/3`)
 4. Pivots (`Selecto.pivot/3`)
 
+### Domain Join Map
+
+```mermaid
+graph LR
+  orders[orders]
+  customers[customers]
+  order_items[order_items]
+  products[products]
+
+  orders -->|customer_id -> id| customers
+  orders -->|id -> order_id| order_items
+  order_items -->|product_id -> id| products
+```
+
+### Selection Mode Map
+
+```mermaid
+flowchart LR
+  base["Configure base query"]
+  flat["Select flat row output"]
+  shaped["Select shape and execute shape"]
+  sub["Subselect aggregated related data"]
+  pivot["Pivot to new root table"]
+
+  base --> flat
+  base --> shaped
+  base --> sub
+  base --> pivot
+```
+
 Before running, initialize the sample database:
 
 Run this command in a terminal (outside Livebook) once per local environment:
@@ -277,10 +307,67 @@ end)
 :ok
 ```
 
+## 1.1) Composable Selection with Multiple `select/2` Calls
+
+`select/2` is composable: you can add fields in stages as requirements evolve.
+This cell builds one query in multiple steps, then executes it.
+
+```elixir
+base_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", {:in, ["processing", "shipped", "delivered"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(5)
+
+# Stage 1: core identifiers
+query_stage_1 =
+  base_query
+  |> Selecto.select(["order_number", "status"])
+
+# Stage 2: business totals
+query_stage_2 =
+  query_stage_1
+  |> Selecto.select(["total"])
+
+# Stage 3: related data + structured projection
+composable_select_query =
+  query_stage_2
+  |> Selecto.select([
+    "customer.name",
+    {:row, ["shipping_city", "shipping_country"], "ship_to"},
+    # Re-selecting "status" demonstrates deduping in set.selected
+    "status"
+  ])
+
+IO.inspect(composable_select_query.set.selected, label: "Final selected fields (deduped)")
+
+{:ok, {rows, _columns, _aliases}} =
+  SelectionFocus.Helpers.run("Composable select query", composable_select_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, ship_to] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} " <>
+      "ship_to=#{inspect(ship_to)}"
+  )
+end)
+
+:ok
+```
+
 ## 2) Selection Shapes (`select_shape/2`)
 
 Selection shapes let you describe a nested list/tuple output and then materialize
 rows with that same structure.
+
+```mermaid
+flowchart TD
+  input_shape["Shape input list and tuple"]
+  compiled_plan["Compile plan and subselects"]
+  execute_shape["Execute shape query"]
+  shaped_rows["Nested shaped rows output"]
+
+  input_shape --> compiled_plan --> execute_shape --> shaped_rows
+```
 
 This cell builds a shape query, prints the compiled shape plan, and executes it with `execute_shape/2`.
 
@@ -462,6 +549,16 @@ SelectionFocus.Helpers.run("Subselect map syntax", map_syntax_query)
 
 Pivoting changes the query root. Here we pivot delivered orders to `order_items`
 to analyze line-level data.
+
+```mermaid
+flowchart LR
+  pre["Orders root with pre pivot filters"]
+  pivot_call["Pivot to order items"]
+  post["Order items root with post pivot filters"]
+  out["Line level rows"]
+
+  pre --> pivot_call --> post --> out
+```
 
 This first pivot cell builds a line-level query rooted at `order_items` and previews raw rows.
 
