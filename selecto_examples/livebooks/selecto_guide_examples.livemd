@@ -1,7 +1,7 @@
 # Selecto Guide - Interactive Examples
 
 ```elixir
-selecto_dep = {:selecto, ">= 0.3.3 and < 0.4.0"}
+selecto_dep = {:selecto, "~> 0.3.5"}
 
 Mix.install([
   selecto_dep,

@@ -5,7 +5,7 @@
 Run this cell first. It installs Selecto and related packages from Hex for this Livebook session.
 
 ```elixir
-selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
+selecto_dep = {:selecto, "~> 0.3.5"}
 
 Mix.install([
   selecto_dep,

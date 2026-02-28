@@ -18,16 +18,11 @@ find_local_package = fn package_name ->
   Enum.find(candidate_paths, &(File.exists?(Path.join(&1, "mix.exs"))))
 end
 
-local_selecto_path = find_local_package.("selecto")
 local_updato_path = find_local_package.("selecto_updato")
 
-# `selecto_updato` declares `{:selecto, path: "../selecto"}`; force one source of truth here.
-selecto_dep =
-  if local_selecto_path do
-    {:selecto, path: local_selecto_path, override: true}
-  else
-    {:selecto, github: "seeken/selecto", branch: "main", override: true}
-  end
+# Selecto is now published on Hex and this tour targets the 0.3.5 API.
+# Keep override true so this wins even if selecto_updato carries a different dep source.
+selecto_dep = {:selecto, "~> 0.3.5", override: true}
 
 updato_dep =
   if local_updato_path do
