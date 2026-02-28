@@ -160,13 +160,7 @@ defmodule OutputLab.Helpers do
   @moduledoc false
 
   def explain(label, query) do
-    {sql, params} = Selecto.to_sql(query)
-
-    IO.puts("\n=== #{label} ===")
-    IO.puts(String.trim(sql))
-    IO.puts("Params: #{inspect(params)}")
-
-    {sql, params}
+    Selecto.Livebook.explain(label, query)
   end
 end
 ```

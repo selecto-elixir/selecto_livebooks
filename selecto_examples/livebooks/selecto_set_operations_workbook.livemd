@@ -137,25 +137,8 @@ defmodule SetOpsLab.Helpers do
   @moduledoc false
 
   def run(label, meaning, query, preview_count \\ 10) do
-    {sql, params} = Selecto.to_sql(query)
-
-    IO.puts("\n=== #{label} ===")
     IO.puts("Meaning: #{meaning}")
-    IO.puts(String.trim(sql))
-    IO.puts("Params: #{inspect(params)}")
-
-    case Selecto.execute(query) do
-      {:ok, {rows, columns, aliases}} = ok ->
-        IO.puts("Rows: #{length(rows)}")
-        IO.puts("Columns: #{inspect(columns)}")
-        IO.puts("Aliases: #{inspect(aliases)}")
-        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
-        ok
-
-      {:error, error} = failure ->
-        IO.puts("Error: #{inspect(error)}")
-        failure
-    end
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
   end
 end
 ```

@@ -139,46 +139,16 @@ defmodule ValuesLab.Helpers do
   @moduledoc false
 
   def explain(label, query) do
-    {sql, params} = Selecto.to_sql(query)
-
-    IO.puts("\n=== #{label} ===")
-    IO.puts(String.trim(sql))
-    IO.puts("Params: #{inspect(params)}")
-
-    {sql, params}
+    Selecto.Livebook.explain(label, query)
   end
 
   def run(label, query, preview_count \\ 10) do
-    explain(label, query)
-
-    case Selecto.execute(query) do
-      {:ok, {rows, columns, aliases}} = ok ->
-        IO.puts("Rows: #{length(rows)}")
-        IO.puts("Columns: #{inspect(columns)}")
-        IO.puts("Aliases: #{inspect(aliases)}")
-        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
-        ok
-
-      {:error, error} = failure ->
-        IO.puts("Error: #{inspect(error)}")
-        failure
-    end
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
   end
 
   def run_shape(label, query, preview_count \\ 10) do
-    explain(label, query)
     IO.inspect(query.set.selection_shape, label: "Compiled shape", pretty: true)
-
-    case Selecto.execute_shape(query) do
-      {:ok, shaped_rows} = ok ->
-        IO.puts("Shaped rows: #{length(shaped_rows)}")
-        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
-        ok
-
-      {:error, error} = failure ->
-        IO.puts("Error: #{inspect(error)}")
-        failure
-    end
+    Selecto.Livebook.run_shape(label, query, preview_count: preview_count)
   end
 end
 ```
