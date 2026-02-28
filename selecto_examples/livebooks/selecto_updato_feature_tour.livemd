@@ -75,6 +75,27 @@ cd selecto_examples
 mix setup
 ```
 
+## How to Use This Updato Tour
+
+* Execute cells in order on first run; later sections depend on records and IDs created earlier.
+* Each section is designed around one mutation capability, then returns a compact summary map you can inspect directly.
+* `run_id` is embedded in inserted data so the examples are isolated and easy to clean up.
+
+### Visual Map: Updato Mutation Lifecycle
+
+```mermaid
+flowchart LR
+  start["new(domain)"] --> mutate["insert, update, upsert, or delete"]
+  mutate --> controls["apply filters, conflict rules, and nested strategy"]
+  controls --> preview["optional dry_run or to_sql preview"]
+  preview --> exec["execute directly or in transaction"]
+  exec --> observe["review returning payload, hooks, and audit"]
+```
+
+## Setup 1: Repo and Support Tables
+
+This cell starts a local repo, resets the hook log process, and ensures helper tables exist for auditing, snapshots, and soft-delete demos.
+
 ```elixir
 import Ecto.Query
 
@@ -146,6 +167,10 @@ end)
 
 :ok
 ```
+
+## Setup 2: Local Ecto Schemas and Hooks
+
+This cell defines minimal runtime schemas and hook callbacks so the notebook can run independently of project compile-time modules.
 
 ```elixir
 defmodule SelectoUpdatoLivebook.Customer do
@@ -381,6 +406,10 @@ end
 :ok
 ```
 
+## Setup 3: Domains, Helpers, and Run Context
+
+This cell creates the SelectoUpdato domains, helper functions, and run-scoped IDs shared across the remaining sections.
+
 ```elixir
 alias SelectoUpdatoLivebook.{
   Repo,
@@ -565,7 +594,20 @@ soft_delete_domain = %{
 %{run_id: run_id}
 ```
 
+### Visual Map: Mutation Section Dependencies
+
+```mermaid
+flowchart LR
+  s1["Insert and returning"] --> s2["insert_all"]
+  s2 --> s3["upsert and nested insert"]
+  s3 --> s4["advanced updates and filter-based copy"]
+  s4 --> s5["transaction and delete variants"]
+  s5 --> s6["Ecto.Multi and cleanup"]
+```
+
 ## Insert, Returning, and with_changeset
+
+Start with single-row inserts, demonstrate selective `returning/2`, and show how to override default validation/change behavior via `with_changeset/2`.
 
 ```elixir
 base_customer_email = "#{run_id}-base@example.test"
@@ -613,6 +655,8 @@ base_customer_id = read_key.(base_customer, :id)
 ```
 
 ## insert_all
+
+Batch insert multiple product rows in one operation, then extract IDs for later update/upsert/delete demonstrations.
 
 ```elixir
 {:ok, inserted_products} =
@@ -672,6 +716,8 @@ product_two_id =
 
 ## upsert, upsert_all, conflict_target, on_conflict
 
+Demonstrate conflict-aware writes for both single and multi-row payloads, including explicit unique-key conflict targets and replacement strategies.
+
 ```elixir
 {:ok, upsert_customer} =
   SelectoUpdato.new(customer_domain)
@@ -723,6 +769,8 @@ product_three_id = Repo.one(from p in Product, where: p.sku == ^"#{run_id}-SKU-C
 ```
 
 ## Nested insert, returning(:all), hooks, and audit
+
+Create a parent record plus nested children, return the full payload, and verify lifecycle hooks and audit entries were emitted.
 
 ```elixir
 {:ok, nested_insert_result} =
@@ -780,6 +828,8 @@ audit_rows =
 ```
 
 ## update with expression tuples, grouped filters, and nested_strategy(:sync)
+
+Show advanced update expressions (numeric/array/json operations), grouped filter logic, and child synchronization with `nested_strategy(:sync)`.
 
 ```elixir
 {:ok, updated_product_one} =
@@ -852,6 +902,8 @@ order_item_count = Repo.aggregate(from(i in OrderItem, where: i.order_id == ^ord
 
 ## dry_run and to_sql
 
+Validate operations without writing data and inspect generated SQL for mutation statements before executing them in production paths.
+
 ```elixir
 dry_run_insert_error =
   SelectoUpdato.new(customer_domain)
@@ -887,6 +939,8 @@ sql_preview =
 ```
 
 ## insert_from_query and filter_from_selecto
+
+Bridge read pipelines to write pipelines by copying rows from a Selecto query and reusing Selecto filters for downstream updates.
 
 ```elixir
 order_selecto_domain = %{
@@ -990,6 +1044,8 @@ snapshots_after_copy =
 
 ## execute, execute_in_transaction, transaction, and envelope mode
 
+Compare execution modes: direct execution, single-op transactional wrappers, explicit transaction blocks, and envelope-style return payloads.
+
 ```elixir
 {:ok, envelope_result} =
   SelectoUpdato.new(order_snapshot_domain)
@@ -1034,6 +1090,17 @@ transaction_result =
 ```
 
 ## delete, confirm_bulk_delete, cascade, and soft_delete
+
+Walk through guarded deletes, cascade strategies, bulk-delete confirmation, and logical deletion with `soft_delete/1`.
+
+```mermaid
+flowchart TD
+  del["Delete request"] --> restrict["Cascade mode: restrict"]
+  del --> cascade["Cascade mode: delete"]
+  del --> soft["Soft delete path"]
+  del --> bulk["Bulk delete path"]
+  bulk --> confirm["Require confirm_bulk_delete true"]
+```
 
 ```elixir
 {:ok, delete_target_result} =
@@ -1122,6 +1189,8 @@ soft_sample_after = Repo.get!(SoftDeleteSample, soft_sample.id)
 
 ## Ecto.Multi integration
 
+Compose several write operations into a single transactional `Ecto.Multi` pipeline with named step outputs.
+
 ```elixir
 multi_result =
   SelectoUpdato.multi()
@@ -1157,7 +1226,7 @@ multi_result
 
 ## Optional cleanup
 
-Run this cell if you want to remove rows created by this notebook run.
+Run this cell if you want to remove rows created by this notebook run and reset the dataset back to pre-tour state.
 
 ```elixir
 Repo.delete_all(from s in SoftDeleteSample, where: ilike(s.name, ^"%#{run_id}%"))
