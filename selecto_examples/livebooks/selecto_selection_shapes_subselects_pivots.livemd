@@ -1,0 +1,300 @@
+# Selecto Focus Notebook: Selection, Shapes, Subselects, and Pivots
+
+```elixir
+find_local_package = fn package_name ->
+  cwd = File.cwd!()
+  ancestors = [cwd | Path.split(cwd) |> Enum.scan("/", &Path.join(&2, &1)) |> Enum.reverse()]
+
+  candidate_paths =
+    ancestors
+    |> Enum.flat_map(fn base ->
+      [
+        Path.join(base, "vendor/#{package_name}"),
+        Path.join(base, package_name)
+      ]
+    end)
+    |> Enum.uniq()
+
+  Enum.find(candidate_paths, &(File.exists?(Path.join(&1, "mix.exs"))))
+end
+
+find_examples_path = fn ->
+  cwd = File.cwd!()
+  ancestors = [cwd | Path.split(cwd) |> Enum.scan("/", &Path.join(&2, &1)) |> Enum.reverse()]
+
+  candidate_paths =
+    ancestors
+    |> Enum.flat_map(fn base ->
+      [
+        base,
+        Path.join(base, "selecto_examples"),
+        Path.join(base, "vendor/selecto_livebooks/selecto_examples")
+      ]
+    end)
+    |> Enum.uniq()
+
+  Enum.find(candidate_paths, fn path ->
+    File.exists?(Path.join(path, "mix.exs")) and
+      File.exists?(Path.join(path, "lib/selecto_examples/domains/order_domain.ex"))
+  end)
+end
+
+local_selecto_path = find_local_package.("selecto")
+
+selecto_dep =
+  if local_selecto_path do
+    {:selecto, path: local_selecto_path}
+  else
+    {:selecto, github: "seeken/selecto", branch: "main"}
+  end
+
+Mix.install([
+  selecto_dep,
+  {:postgrex, "~> 0.17"},
+  {:ecto_sql, "~> 3.11"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.12"}
+])
+
+examples_path = find_examples_path.()
+
+if is_nil(examples_path) do
+  raise "Could not find selecto_examples project. Open this notebook from selecto_livebooks/selecto_examples/livebooks or run from repo root."
+end
+
+Enum.each([
+  "lib/selecto_examples/repo.ex",
+  "lib/selecto_examples/domains/order_domain.ex"
+], fn relative_path ->
+  Code.require_file(Path.join(examples_path, relative_path))
+end)
+
+IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
+IO.puts("Using selecto_examples path: #{examples_path}")
+```
+
+## Overview
+
+This notebook focuses on four related query-building patterns:
+
+1. Selection (`Selecto.select/2`)
+2. Selection shapes (`Selecto.select_shape/2` + `Selecto.execute_shape/2`)
+3. Subselects (`Selecto.subselect/3`)
+4. Pivots (`Selecto.pivot/3`)
+
+Before running, initialize the sample database:
+
+```bash
+cd selecto_examples
+mix setup
+```
+
+```elixir
+alias SelectoExamples.Domains.OrderDomain
+
+repo_config = [
+  database: System.get_env("SELECTO_EXAMPLES_DB", "selecto_examples_dev"),
+  username: System.get_env("SELECTO_EXAMPLES_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_EXAMPLES_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_EXAMPLES_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_EXAMPLES_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(SelectoExamples.Repo) do
+  nil -> {:ok, _pid} = SelectoExamples.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: SelectoExamples.Repo,
+  order_domain: OrderDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+[[order_count]] = result.rows
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+```elixir
+defmodule SelectionFocus.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+
+    {sql, params}
+  end
+
+  def run(label, query, opts \\ []) do
+    explain(label, query)
+
+    case Selecto.execute(query, opts) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, 5), label: "Preview (up to 5 rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Selection Basics
+
+```elixir
+selection_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "total",
+    "customer.name",
+    {:row, ["shipping_city", "shipping_country"], "ship_to"},
+    {:field, {:array, [{:field, "status"}, {:field, "shipping_country"}]}, "status_country"}
+  ])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped", "delivered"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(5)
+
+{:ok, {rows, _columns, _aliases}} = SelectionFocus.Helpers.run("Selection query", selection_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, ship_to, status_country] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} " <>
+      "ship_to=#{inspect(ship_to)} status_country=#{inspect(status_country)}"
+  )
+end)
+
+:ok
+```
+
+## 2) Selection Shapes (`select_shape/2`)
+
+Selection shapes let you describe a nested list/tuple output and then materialize
+rows with that same structure.
+
+```elixir
+shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "total"},
+    "customer.name",
+    ["order_items.quantity", "order_items.line_total"]
+  ])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.explain("Selection shape query", shape_query)
+IO.inspect(shape_query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+{:ok, shaped_rows} = Selecto.execute_shape(shape_query)
+IO.inspect(shaped_rows, label: "execute_shape/2 output", pretty: true, limit: :infinity)
+
+Enum.each(shaped_rows, fn [order_number, {status, total}, customer_name, line_items] ->
+  IO.puts("\norder=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name}")
+
+  Enum.each(line_items, fn [quantity, line_total] ->
+    IO.puts("  item quantity=#{quantity} line_total=#{inspect(line_total)}")
+  end)
+end)
+
+:ok
+```
+
+## 3) Explicit Subselects (`subselect/3`)
+
+Use `subselect/3` when you want explicit control over embedded related data.
+
+```elixir
+subselect_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total", "customer.name"])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.subselect([
+    %{
+      target_schema: :order_items,
+      fields: ["quantity", "line_total"],
+      format: :json_agg,
+      alias: "line_items"
+    }
+  ])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(5)
+
+{:ok, {rows, _columns, _aliases}} = SelectionFocus.Helpers.run("Subselect query", subselect_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, line_items] ->
+  count = line_items |> List.wrap() |> length()
+
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} line_items=#{count}"
+  )
+end)
+
+:ok
+```
+
+## 4) Pivoting (`pivot/3`)
+
+Pivoting changes the query root. Here we pivot delivered orders to `order_items`
+to analyze line-level data.
+
+```elixir
+pivot_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.select([
+    {:field, "order_items.product_id", "product_id"},
+    {:field, "order_items.quantity", "quantity"},
+    {:field, "order_items.line_total", "line_total"}
+  ])
+
+SelectionFocus.Helpers.run("Pivot query (line-level rows)", pivot_query)
+```
+
+```elixir
+{:ok, {rows, _columns, _aliases}} = Selecto.execute(pivot_query)
+
+rows
+|> Enum.group_by(fn [product_id, _quantity, _line_total] -> product_id end)
+|> Enum.map(fn {product_id, product_rows} ->
+  quantity_sum = Enum.reduce(product_rows, 0, fn [_product_id, quantity, _line_total], acc -> acc + quantity end)
+
+  revenue_sum =
+    Enum.reduce(product_rows, Decimal.new("0"), fn [_product_id, _quantity, line_total], acc ->
+      Decimal.add(acc, line_total || Decimal.new("0"))
+    end)
+
+  {product_id, quantity_sum, revenue_sum}
+end)
+|> Enum.sort(fn {_product_id_a, _quantity_sum_a, revenue_a}, {_product_id_b, _quantity_sum_b, revenue_b} ->
+  Decimal.compare(revenue_a, revenue_b) in [:gt, :eq]
+end)
+|> Enum.take(10)
+|> Enum.each(fn {product_id, quantity_sum, revenue_sum} ->
+  IO.puts("product_id=#{product_id} delivered_quantity=#{quantity_sum} delivered_revenue=#{inspect(revenue_sum)}")
+end)
+
+:ok
+```
+
+## Next Steps
+
+- Try adding filters before and after pivot to compare generated SQL.
+- Try replacing explicit `subselect/3` with `select_shape/2` nested containers.
+- Compare `Selecto.execute/2` with `Selecto.execute_shape/2` for the same logical query.

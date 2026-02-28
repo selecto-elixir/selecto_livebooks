@@ -12,6 +12,7 @@ queries interactively.
 - Livebook notebooks under:
   - `livebooks/selecto_guide_examples.livemd`
   - `livebooks/selecto_updato_feature_tour.livemd`
+  - `livebooks/selecto_selection_shapes_subselects_pivots.livemd`
 
 ## Requirements
 
@@ -53,6 +54,10 @@ Then open:
 or:
 
 `selecto_examples/livebooks/selecto_updato_feature_tour.livemd`
+
+or:
+
+`selecto_examples/livebooks/selecto_selection_shapes_subselects_pivots.livemd`
 
 ## Notes
 

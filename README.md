@@ -10,6 +10,9 @@ It includes:
   end-to-end guide covering core and advanced Selecto features
 - `selecto_examples/livebooks/selecto_updato_feature_tour.livemd` - a
   full write-path tour covering the complete SelectoUpdato public API
+- `selecto_examples/livebooks/selecto_selection_shapes_subselects_pivots.livemd` -
+  focused examples for selection patterns, selection shapes, subselects, and
+  pivoted query roots
 
 ## What This Repo Does
 
@@ -42,8 +45,9 @@ The examples are centered on an e-commerce-style dataset and demonstrate:
    ```bash
    livebook server
    ```
-4. Open:
-   `selecto_examples/livebooks/selecto_guide_examples.livemd`
+4. Open one notebook:
+   - `selecto_examples/livebooks/selecto_guide_examples.livemd`
+   - `selecto_examples/livebooks/selecto_selection_shapes_subselects_pivots.livemd`
 
 ## Dependency Source
 
