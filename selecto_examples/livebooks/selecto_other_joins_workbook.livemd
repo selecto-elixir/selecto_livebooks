@@ -26,6 +26,7 @@ This workbook covers join patterns beyond basic dot-notation selection:
 2. Parameterized joins (`join_parameterize/4`) for multiple aliases of the same relationship
 3. Subquery joins (`join_subquery/4`) for joining derived result sets
 4. Custom dynamic joins (`join/3`) to tables not declared as associations in the source schema
+5. Structured shaped output for advanced joins via `select_shape/2`
 
 ```mermaid
 flowchart LR
@@ -222,6 +223,22 @@ defmodule JoinLab.Helpers do
         failure
     end
   end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
 end
 ```
 
@@ -268,6 +285,36 @@ parameterized_join_query =
   |> Selecto.limit(10)
 
 JoinLab.Helpers.run("Parameterized joins with tier filters", parameterized_join_query)
+```
+
+## 2.1) Parameterized Joins with `select_shape/2`
+
+Render parameterized join results in a nested row shape so premium and standard alias fields are grouped explicitly.
+
+```elixir
+parameterized_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_parameterize(:customer, "premium", tier: "premium")
+  |> Selecto.join_parameterize(:customer, "standard", tier: "standard")
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "total"},
+    {"customer:premium.name", "customer:standard.name"}
+  ])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{:ok, shaped_rows} =
+  JoinLab.Helpers.run_shape("Parameterized joins with select_shape", parameterized_shape_query)
+
+Enum.each(shaped_rows, fn [order_number, {status, total}, {premium_name, standard_name}] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} " <>
+      "premium=#{inspect(premium_name)} standard=#{inspect(standard_name)}"
+  )
+end)
+
+:ok
 ```
 
 ## 3) Parameterized Join with Boolean Filter Variants
@@ -320,6 +367,49 @@ subquery_join_query =
   |> Selecto.limit(10)
 
 JoinLab.Helpers.run("Subquery join for high-value delivered orders", subquery_join_query)
+```
+
+## 4.1) Subquery Join with `select_shape/2`
+
+Use `select_shape/2` on a subquery join.
+Note: a tuple/list containing only `high_value_delivered.*` fields is interpreted as a subselect node and currently fails for `join_subquery` aliases, so this shape keeps those fields flat and groups them in rendering.
+
+```elixir
+high_value_delivered_orders_shape =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["customer_id", "order_number", "total"])
+  |> Selecto.filter({:and, [
+    {"status", "delivered"},
+    {"total", {:>, 500}}
+  ]})
+
+subquery_shape_query =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.join_subquery(:high_value_delivered, high_value_delivered_orders_shape,
+    type: :inner,
+    on: [%{left: "id", right: "customer_id"}]
+  )
+  |> Selecto.select_shape([
+    {"name", "tier", "country"},
+    "high_value_delivered.order_number",
+    "high_value_delivered.total"
+  ])
+  |> Selecto.order_by({"high_value_delivered.total", :desc})
+  |> Selecto.limit(10)
+
+{:ok, subquery_shaped_rows} =
+  JoinLab.Helpers.run_shape("Subquery join with select_shape", subquery_shape_query)
+
+Enum.each(subquery_shaped_rows, fn [{customer_name, tier, country}, order_number, total] ->
+  high_value_order = {order_number, total}
+
+  IO.puts(
+    "customer=#{customer_name} tier=#{tier} country=#{country} " <>
+      "order=#{elem(high_value_order, 0)} total=#{inspect(elem(high_value_order, 1))}"
+  )
+end)
+
+:ok
 ```
 
 ## 5) Custom Dynamic Join to an Unconfigured Table

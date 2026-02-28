@@ -26,6 +26,7 @@ This workbook focuses on CTE workflows in Selecto:
 2. CTE-enriched result sets via explicit CTE joins
 3. Recursive CTE (`with_recursive_cte/3`) for hierarchy traversal
 4. Multiple CTE composition (`with_ctes/2`)
+5. Shaped CTE output with `select_shape/2` and `execute_shape/2`
 
 ```mermaid
 flowchart LR
@@ -241,6 +242,22 @@ defmodule CteLab.Helpers do
         IO.puts("Columns: #{inspect(columns)}")
         IO.puts("Aliases: #{inspect(aliases)}")
         IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
         ok
 
       {:error, error} = failure ->
@@ -470,6 +487,71 @@ multi_cte_query =
   |> Selecto.limit(10)
 
 CteLab.Helpers.run("Multiple CTE composition", multi_cte_query)
+```
+
+## 5) Multiple CTEs with `select_shape/2`
+
+Use the same multi-CTE pattern but return a structured, nested row shape so each result is easier to consume in Elixir.
+
+```elixir
+alias Selecto.Advanced.CTE
+
+high_value_orders_cte_shape =
+  CTE.create_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.filter({"total", {:>, 500}})
+  end)
+
+customer_order_counts_cte_shape =
+  CTE.create_cte("customer_order_counts", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["customer_id", {:count, "*"}])
+    |> Selecto.group_by(["customer_id"])
+  end)
+
+multi_cte_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_ctes([high_value_orders_cte_shape, customer_order_counts_cte_shape])
+  |> Selecto.join(:high_value_orders,
+    source: "high_value_orders",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{
+      total: %{type: :decimal},
+      customer_id: %{type: :integer}
+    }
+  )
+  |> Selecto.join(:customer_order_counts,
+    source: "customer_order_counts",
+    type: :inner,
+    owner_key: :customer_id,
+    related_key: :customer_id,
+    fields: %{
+      customer_id: %{type: :integer},
+      count: %{type: :integer}
+    }
+  )
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "customer.name"},
+    {"high_value_orders.total", "customer_order_counts.count"}
+  ])
+  |> Selecto.filter({"customer_order_counts.count", {:>=, 2}})
+  |> Selecto.order_by({"high_value_orders.total", :desc})
+  |> Selecto.limit(10)
+
+{:ok, shaped_rows} = CteLab.Helpers.run_shape("Multiple CTE composition with select_shape", multi_cte_shape_query)
+
+Enum.each(shaped_rows, fn [order_number, {status, customer_name}, {order_total, repeat_count}] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} customer=#{customer_name} " <>
+      "cte_total=#{inspect(order_total)} repeat_orders=#{repeat_count}"
+  )
+end)
+
+:ok
 ```
 
 ## Next Steps
