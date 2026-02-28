@@ -1,31 +1,7 @@
 # Selecto Guide - Interactive Examples
 
 ```elixir
-find_local_selecto = fn ->
-  cwd = File.cwd!()
-  ancestors = [cwd | Path.split(cwd) |> Enum.scan("/", &Path.join(&2, &1)) |> Enum.reverse()]
-
-  candidate_paths =
-    ancestors
-    |> Enum.flat_map(fn base ->
-      [
-        Path.join(base, "vendor/selecto"),
-        Path.join(base, "selecto")
-      ]
-    end)
-    |> Enum.uniq()
-
-  Enum.find(candidate_paths, &(File.exists?(Path.join(&1, "mix.exs"))))
-end
-
-local_selecto_path = find_local_selecto.()
-
-selecto_dep =
-  if local_selecto_path do
-    {:selecto, path: local_selecto_path}
-  else
-    {:selecto, github: "seeken/selecto", branch: "main"}
-  end
+selecto_dep = {:selecto, ">= 0.3.3 and < 0.4.0"}
 
 Mix.install([
   selecto_dep,
@@ -36,13 +12,6 @@ Mix.install([
 ])
 
 IO.puts("Using Selecto dependency: #{inspect(selecto_dep)}")
-
-if match?({:selecto, github: _, branch: _}, selecto_dep) do
-  IO.puts("""
-  WARNING: using GitHub Selecto fallback.
-  Hierarchy join examples may fail if the selected branch does not include legacy CTE compatibility.
-  """)
-end
 ```
 
 ## Introduction
