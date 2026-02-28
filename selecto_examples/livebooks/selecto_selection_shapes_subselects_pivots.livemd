@@ -1,5 +1,9 @@
 # Selecto Focus Notebook: Selection, Shapes, Subselects, and Pivots
 
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs Selecto and supporting libraries from Hex for this Livebook session.
+
 ```elixir
 selecto_dep = {:selecto, ">= 0.3.4 and < 0.4.0"}
 
@@ -25,10 +29,16 @@ This notebook focuses on four related query-building patterns:
 
 Before running, initialize the sample database:
 
+Run this command in a terminal (outside Livebook) once per local environment:
+
 ```bash
 cd selecto_examples
 mix setup
 ```
+
+## Setup 2) Connect to Repo and Build Domain Config
+
+This cell defines a local Repo module and an in-notebook `OrderDomain` config, then connects to PostgreSQL and verifies the `orders` table count.
 
 ```elixir
 defmodule SelectionFocus.Repo do
@@ -198,6 +208,10 @@ IO.puts("Connected. Orders in dataset: #{order_count}")
 config
 ```
 
+## Setup 3) Define Query Helpers
+
+This helper cell adds utility functions that print generated SQL/params and execute queries with a consistent preview format.
+
 ```elixir
 defmodule SelectionFocus.Helpers do
   @moduledoc false
@@ -233,6 +247,9 @@ end
 
 ## 1) Selection Basics
 
+This cell demonstrates mixed selection output:
+plain fields, joined fields, a structured row (`ship_to`), and a computed array field.
+
 ```elixir
 selection_query =
   Selecto.configure(config.order_domain, config.repo)
@@ -265,6 +282,8 @@ end)
 Selection shapes let you describe a nested list/tuple output and then materialize
 rows with that same structure.
 
+This cell builds a shape query, prints the compiled shape plan, and executes it with `execute_shape/2`.
+
 ```elixir
 shape_query =
   Selecto.configure(config.order_domain, config.repo)
@@ -295,9 +314,44 @@ end)
 :ok
 ```
 
+## 2.1) Shape Variant: Tuple Subselect Nodes
+
+Tuple containers over a single joined schema materialize as lists of tuples.
+This is useful when you want stronger positional semantics than list-of-lists output.
+
+```elixir
+tuple_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select_shape([
+    "order_number",
+    {"order_items.quantity", "order_items.line_total"}
+  ])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.explain("Tuple shape query", tuple_shape_query)
+IO.inspect(tuple_shape_query.set.selection_shape, label: "Tuple shape plan", pretty: true, limit: :infinity)
+
+{:ok, tuple_shaped_rows} = Selecto.execute_shape(tuple_shape_query)
+IO.inspect(tuple_shaped_rows, label: "Tuple-shape output", pretty: true, limit: :infinity)
+
+Enum.each(tuple_shaped_rows, fn [order_number, item_tuples] ->
+  IO.puts("\norder=#{order_number} tuple_items=#{length(item_tuples)}")
+
+  Enum.each(item_tuples, fn {quantity, line_total} ->
+    IO.puts("  tuple item quantity=#{quantity} line_total=#{inspect(line_total)}")
+  end)
+end)
+
+:ok
+```
+
 ## 3) Explicit Subselects (`subselect/3`)
 
 Use `subselect/3` when you want explicit control over embedded related data.
+
+This cell adds an explicit JSON aggregate subselect for `order_items` and prints per-order item counts.
 
 ```elixir
 subselect_query =
@@ -328,10 +382,88 @@ end)
 :ok
 ```
 
+## 3.1) Subselect Format Matrix
+
+This cell compares the four built-in subselect aggregation formats:
+`:json_agg`, `:array_agg`, `:string_agg`, and `:count`.
+
+```elixir
+subselect_formats = [
+  {"json_agg", %{fields: ["quantity", "line_total"], target_schema: :order_items, format: :json_agg, alias: "line_items_json"}},
+  {"array_agg", %{fields: ["quantity"], target_schema: :order_items, format: :array_agg, alias: "quantities_array"}},
+  {"string_agg", %{fields: ["quantity"], target_schema: :order_items, format: :string_agg, alias: "quantities_csv", separator: ", "}},
+  {"count", %{fields: ["id"], target_schema: :order_items, format: :count, alias: "line_item_count"}}
+]
+
+Enum.each(subselect_formats, fn {label, spec} ->
+  query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["order_number", "status"])
+    |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+    |> Selecto.subselect([spec])
+    |> Selecto.order_by({"inserted_at", :desc})
+    |> Selecto.limit(2)
+
+  SelectionFocus.Helpers.explain("Subselect format: #{label}", query)
+
+  case Selecto.execute(query) do
+    {:ok, {rows, _columns, _aliases}} ->
+      IO.inspect(rows, label: "Preview rows (#{label})", pretty: true, limit: :infinity)
+
+    {:error, error} ->
+      IO.puts("Error for #{label}: #{inspect(error)}")
+  end
+end)
+
+:ok
+```
+
+## 3.2) Subselect Syntax Variants
+
+`subselect/3` accepts both compact string syntax and explicit map syntax.
+This cell runs one query for each style so you can compare readability and output.
+
+```elixir
+string_syntax_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "customer.name"])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.subselect(["order_items[quantity, line_total]"])
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.run("Subselect string syntax", string_syntax_query)
+
+map_syntax_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "customer.name"])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped"]}})
+  |> Selecto.subselect([
+    %{
+      target_schema: :order_items,
+      fields: ["id"],
+      format: :count,
+      alias: "line_item_count"
+    },
+    %{
+      target_schema: :order_items,
+      fields: ["line_total"],
+      format: :array_agg,
+      alias: "line_totals"
+    }
+  ])
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.run("Subselect map syntax", map_syntax_query)
+```
+
 ## 4) Pivoting (`pivot/3`)
 
 Pivoting changes the query root. Here we pivot delivered orders to `order_items`
 to analyze line-level data.
+
+This first pivot cell builds a line-level query rooted at `order_items` and previews raw rows.
 
 ```elixir
 pivot_query =
@@ -346,6 +478,8 @@ pivot_query =
 
 SelectionFocus.Helpers.run("Pivot query (line-level rows)", pivot_query)
 ```
+
+This follow-up cell aggregates pivoted rows into product-level metrics (delivered quantity and revenue), then prints the top results.
 
 ```elixir
 {:ok, {rows, _columns, _aliases}} = Selecto.execute(pivot_query)
@@ -369,6 +503,99 @@ end)
 |> Enum.each(fn {product_id, quantity_sum, revenue_sum} ->
   IO.puts("product_id=#{product_id} delivered_quantity=#{quantity_sum} delivered_revenue=#{inspect(revenue_sum)}")
 end)
+
+:ok
+```
+
+## 4.1) Pivot Strategy Comparison (`:in`, `:exists`, `:join`)
+
+This cell compares generated SQL and row counts across supported pivot subquery strategies.
+
+```elixir
+Enum.each([:in, :exists, :join], fn strategy ->
+  query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.filter({"status", "delivered"})
+    |> Selecto.pivot(:order_items, subquery_strategy: strategy)
+    |> Selecto.select([
+      {:field, "order_items.product_id", "product_id"},
+      {:field, "order_items.quantity", "quantity"},
+      {:field, "order_items.line_total", "line_total"}
+    ])
+    |> Selecto.limit(5)
+
+  SelectionFocus.Helpers.explain("Pivot strategy #{strategy}", query)
+
+  case Selecto.execute(query) do
+    {:ok, {strategy_rows, _columns, _aliases}} ->
+      IO.puts("Rows returned for #{strategy}: #{length(strategy_rows)}")
+      IO.inspect(Enum.take(strategy_rows, 3), label: "Preview (#{strategy})")
+
+    {:error, error} ->
+      IO.puts("Error for #{strategy}: #{inspect(error)}")
+  end
+end)
+
+:ok
+```
+
+## 4.2) Pre- vs Post-Pivot Filters (`preserve_filters`)
+
+Filters added before `pivot/3` are preserved as pre-pivot constraints.
+Filters added after `pivot/3` are post-pivot constraints on the new root.
+This cell compares SQL and results for:
+
+1. pre-pivot only
+2. pre + post pivot
+3. post-pivot only with `preserve_filters: false`
+
+```elixir
+pivot_pre_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.select([
+    {:field, "order_items.product_id", "product_id"},
+    {:field, "order_items.quantity", "quantity"}
+  ])
+  |> Selecto.limit(5)
+
+pivot_pre_and_post_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.filter({"order_items.quantity", {:gt, 2}})
+  |> Selecto.select([
+    {:field, "order_items.product_id", "product_id"},
+    {:field, "order_items.quantity", "quantity"}
+  ])
+  |> Selecto.limit(5)
+
+pivot_post_only_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists, preserve_filters: false)
+  |> Selecto.filter({"order_items.quantity", {:gt, 2}})
+  |> Selecto.select([
+    {:field, "order_items.product_id", "product_id"},
+    {:field, "order_items.quantity", "quantity"}
+  ])
+  |> Selecto.limit(5)
+
+for {label, query} <- [
+      {"pre-pivot filter only", pivot_pre_filter_query},
+      {"pre + post pivot filters", pivot_pre_and_post_filter_query},
+      {"post-pivot only (preserve_filters: false)", pivot_post_only_query}
+    ] do
+  {sql, _params} = Selecto.to_sql(query)
+  sql_downcase = String.downcase(sql)
+
+  IO.puts("\n#{label}")
+  IO.puts("contains status filter: #{String.contains?(sql_downcase, "status")}")
+  IO.puts("contains quantity filter: #{String.contains?(sql_downcase, "quantity")}")
+
+  SelectionFocus.Helpers.run(label, query)
+end
 
 :ok
 ```
