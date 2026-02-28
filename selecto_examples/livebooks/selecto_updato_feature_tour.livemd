@@ -941,6 +941,7 @@ sql_preview =
 ## insert_from_query and filter_from_selecto
 
 Bridge read pipelines to write pipelines by copying rows from a Selecto query and reusing Selecto filters for downstream updates.
+`Selecto.query_filters/1` provides a stable way to extract filters from either legacy or set-based query structures.
 
 ```elixir
 order_selecto_domain = %{
@@ -990,26 +991,7 @@ snapshot_filter_query =
   |> Selecto.filter({"order_number", {:ilike, "#{run_id}%"}})
   |> Selecto.filter({"status", "processing"})
 
-extract_selecto_filters = fn selecto_query ->
-  legacy_filters = Map.get(selecto_query, :filters, [])
-
-  selecto_set =
-    case Map.get(selecto_query, :set) do
-      %{} = set -> set
-      _ -> %{}
-    end
-
-  set_filters = Map.get(selecto_set, :filtered) || Map.get(selecto_set, :filters) || []
-  post_pivot_filters = Map.get(selecto_set, :post_pivot_filters) || []
-
-  [legacy_filters, set_filters, post_pivot_filters]
-  |> Enum.flat_map(fn
-    filters when is_list(filters) -> filters
-    _ -> []
-  end)
-end
-
-snapshot_filters = extract_selecto_filters.(snapshot_filter_query)
+snapshot_filters = Selecto.query_filters(snapshot_filter_query)
 
 snapshot_update_op =
   SelectoUpdato.new(order_snapshot_domain)
