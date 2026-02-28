@@ -291,10 +291,173 @@ end)
 :ok
 ```
 
+## 6) Cross-Domain Set-Op with `column_mapping`
+
+Use `column_mapping` to union compatible value types across domains with different field names.
+
+```elixir
+customer_domain_for_set_ops = %{
+  name: "Customers",
+  source: %{
+    source_table: "customers",
+    primary_key: :id,
+    fields: [:id, :name, :email, :country, :active],
+    columns: %{
+      id: %{type: :integer},
+      name: %{type: :string},
+      email: %{type: :string},
+      country: %{type: :string},
+      active: %{type: :boolean}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  joins: %{}
+}
+
+employees_identity_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select(["id", "first_name", "last_name", "department"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.limit(25)
+
+customers_identity_query =
+  Selecto.configure(customer_domain_for_set_ops, config.repo)
+  |> Selecto.select(["id", "name", "email", "country"])
+  |> Selecto.filter({"active", true})
+  |> Selecto.limit(25)
+
+cross_domain_union_query =
+  Selecto.union(
+    employees_identity_query,
+    customers_identity_query,
+    all: true,
+    column_mapping: [
+      {"first_name", "name"},
+      {"last_name", "email"},
+      {"department", "country"}
+    ]
+  )
+
+SetOpsLab.Helpers.run(
+  "Cross-domain UNION ALL with column_mapping",
+  "Employee identity rows and customer identity rows combined via mapped columns.",
+  cross_domain_union_query,
+  10
+)
+```
+
+## 7) Deduplicating vs Non-Deduplicating Timing Snapshot
+
+Compare execution timing for `UNION` and `UNION ALL` over repeated runs.
+
+```elixir
+build_base_cohorts = fn ->
+  employees_with_manager_local =
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.select(["id", "first_name", "last_name", "title"])
+    |> Selecto.filter({"manager_id", :not_null})
+
+  employees_with_direct_reports_local =
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.join(:direct_report,
+      source: "employees",
+      type: :inner,
+      owner_key: :id,
+      related_key: :manager_id,
+      fields: %{id: %{type: :integer}}
+    )
+    |> Selecto.filter({"direct_report.id", :not_null})
+    |> Selecto.select(["id", "first_name", "last_name", "title"])
+    |> Selecto.group_by(["id", "first_name", "last_name", "title"])
+
+  {
+    Selecto.union(employees_with_manager_local, employees_with_direct_reports_local),
+    Selecto.union(employees_with_manager_local, employees_with_direct_reports_local, all: true)
+  }
+end
+
+{bench_union_query, bench_union_all_query} = build_base_cohorts.()
+
+benchmark = fn label, query, iterations ->
+  samples =
+    Enum.map(1..iterations, fn _ ->
+      {microseconds, result} = :timer.tc(fn -> Selecto.execute(query) end)
+
+      row_count =
+        case result do
+          {:ok, {rows, _, _}} -> length(rows)
+          _ -> :error
+        end
+
+      {microseconds / 1000.0, row_count}
+    end)
+
+  ms_samples = Enum.map(samples, fn {ms, _} -> ms end)
+  avg_ms = Enum.sum(ms_samples) / max(length(ms_samples), 1)
+
+  IO.puts("\n#{label}")
+  IO.puts("avg ms over #{iterations} runs: #{Float.round(avg_ms, 3)}")
+  IO.inspect(Enum.take(samples, 3), label: "sample runs (ms, row_count)")
+end
+
+benchmark.("UNION (deduplicating)", bench_union_query, 6)
+benchmark.("UNION ALL (non-deduplicating)", bench_union_all_query, 6)
+```
+
+## 8) Set Operations with CTE-Staged Cohorts
+
+Build cohorts through CTEs first, then combine them with set operations.
+
+```elixir
+staged_has_manager_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_cte("has_manager_ids", fn ->
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.select(["id"])
+    |> Selecto.filter({"manager_id", :not_null})
+  end, columns: ["id"])
+  |> Selecto.join(:has_manager_ids,
+    source: "has_manager_ids",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{id: %{type: :integer}}
+  )
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+
+staged_is_manager_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_cte("manager_ids", fn ->
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.select(["manager_id"])
+    |> Selecto.filter({"manager_id", :not_null})
+    |> Selecto.group_by(["manager_id"])
+  end, columns: ["id"])
+  |> Selecto.join(:manager_ids,
+    source: "manager_ids",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{id: %{type: :integer}}
+  )
+  |> Selecto.select(["id", "first_name", "last_name", "title"])
+
+staged_intersection_query =
+  Selecto.intersect(staged_has_manager_query, staged_is_manager_query)
+
+SetOpsLab.Helpers.run(
+  "CTE-staged INTERSECT",
+  "Employees who both report upward and manage someone, with cohorts prepared by CTEs.",
+  staged_intersection_query,
+  10
+)
+```
+
 ## Next Steps
 
 To extend this workbook, add:
 
-1. A cross-domain set-op using `column_mapping` for incompatible schemas
-2. Performance comparison between deduplicating and non-deduplicating variants
-3. A section combining set operations with CTEs for staged cohort definitions
+1. Set-op examples with `EXCEPT ALL` and `INTERSECT ALL` where duplicates are meaningful
+2. A workbook cell that visualizes overlaps as a small Venn-style summary table
+3. A paging strategy section for large set-op outputs

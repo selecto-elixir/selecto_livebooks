@@ -384,8 +384,168 @@ subquery_filter_query =
 FilteringLab.Helpers.run("Subquery filter", subquery_filter_query)
 ```
 
+## 9) JSON and Array-Specific Filters
+
+This section adds a product-focused domain so you can combine `json_filter/2` and `array_filter/2` in one query.
+
+```elixir
+product_filter_domain = %{
+  name: "Products",
+  source: %{
+    source_table: "products",
+    primary_key: :id,
+    fields: [:id, :name, :price, :stock_quantity, :reorder_level, :active, :tags, :metadata],
+    columns: %{
+      id: %{type: :integer},
+      name: %{type: :string},
+      price: %{type: :decimal},
+      stock_quantity: %{type: :integer},
+      reorder_level: %{type: :integer},
+      active: %{type: :boolean},
+      tags: %{type: {:array, :string}},
+      metadata: %{type: :jsonb}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  joins: %{}
+}
+
+metadata_refresh =
+  config.repo.query!("""
+  UPDATE products
+  SET metadata = jsonb_build_object(
+    'price_band',
+    CASE
+      WHEN price >= 100 THEN 'premium'
+      WHEN price >= 50 THEN 'mid'
+      ELSE 'budget'
+    END,
+    'warehouse',
+    jsonb_build_object(
+      'zone',
+      CASE WHEN stock_quantity <= reorder_level THEN 'restock' ELSE 'in_stock' END
+    ),
+    'flags',
+    jsonb_build_array(
+      CASE WHEN active THEN 'active' ELSE 'inactive' END,
+      CASE WHEN coalesce(array_length(tags, 1), 0) > 0 THEN 'has_tags' ELSE 'untagged' END
+    )
+  )
+  """)
+
+IO.puts("Product metadata refreshed for filter demo: #{metadata_refresh.num_rows}")
+
+json_array_filter_query =
+  Selecto.configure(product_filter_domain, config.repo)
+  |> Selecto.select(["name", "price", "tags", "active"])
+  |> Selecto.json_select([
+    {:json_extract_text, "metadata", "$.price_band", as: "price_band"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", as: "warehouse_zone"}
+  ])
+  |> Selecto.json_filter([
+    {:json_extract_text, "metadata", "$.warehouse.zone", {:=, "in_stock"}},
+    {:json_path_exists, "metadata", "$.flags[0]"}
+  ])
+  |> Selecto.array_filter({:array_overlap, "tags", ["featured", "new", "promo"]})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("JSON + array filters", json_array_filter_query)
+```
+
+## 10) Equivalent Filters Before vs After `pivot/3`
+
+Compare pre-pivot and post-pivot filtering behavior and inspect the resulting SQL.
+
+```elixir
+pivot_pre_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.select(["order_items.product_id", "order_items.quantity", "order_items.line_total"])
+  |> Selecto.limit(10)
+
+pivot_pre_and_post_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists)
+  |> Selecto.filter({"order_items.quantity", {:gt, 2}})
+  |> Selecto.select(["order_items.product_id", "order_items.quantity", "order_items.line_total"])
+  |> Selecto.limit(10)
+
+pivot_post_only_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", "delivered"})
+  |> Selecto.pivot(:order_items, subquery_strategy: :exists, preserve_filters: false)
+  |> Selecto.filter({"order_items.quantity", {:gt, 2}})
+  |> Selecto.select(["order_items.product_id", "order_items.quantity", "order_items.line_total"])
+  |> Selecto.limit(10)
+
+for {label, query} <- [
+      {"Pre-pivot filter only", pivot_pre_filter_query},
+      {"Pre + post pivot filters", pivot_pre_and_post_filter_query},
+      {"Post-pivot only (preserve_filters: false)", pivot_post_only_query}
+    ] do
+  {sql, _params} = Selecto.to_sql(query)
+  sql_downcase = String.downcase(sql)
+
+  IO.puts("\n#{label}")
+  IO.puts("Contains status predicate? #{String.contains?(sql_downcase, "status")}")
+  IO.puts("Contains quantity predicate? #{String.contains?(sql_downcase, "quantity")}")
+
+  FilteringLab.Helpers.run(label, query, 5)
+end
+
+:ok
+```
+
+## 11) Filter Challenge: Build and Verify SQL
+
+Edit the challenge builder to meet the goal, then use SQL fragment checks to confirm the query includes each required condition.
+
+```elixir
+challenge_goal = """
+Return delivered or shipped orders to USA/Canada with total >= 120,
+sorted by total descending.
+"""
+
+IO.puts("Challenge goal: " <> String.trim(challenge_goal))
+
+challenge_query_builder = fn ->
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "shipping_country", "total"])
+  |> Selecto.filter(
+    {:and,
+     [
+       {:or, [{"status", "delivered"}, {"status", "shipped"}]},
+       {"shipping_country", {:in, ["USA", "Canada"]}},
+       {"total", {:gte, 120}}
+     ]}
+  )
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+end
+
+challenge_query = challenge_query_builder.()
+{challenge_sql, _challenge_params} = Selecto.to_sql(challenge_query)
+challenge_sql_downcase = String.downcase(challenge_sql)
+
+required_fragments = ["status", "shipping_country", "total", "order by", "limit"]
+
+fragment_checks =
+  Enum.map(required_fragments, fn fragment ->
+    {fragment, String.contains?(challenge_sql_downcase, fragment)}
+  end)
+
+IO.inspect(fragment_checks, label: "SQL fragment checks")
+IO.puts("All checks pass? #{Enum.all?(fragment_checks, fn {_f, ok?} -> ok? end)}")
+
+FilteringLab.Helpers.run("Challenge query", challenge_query, 10)
+```
+
 ## Next Steps
 
-* Add a section for JSON and array-specific filters (`json_filter/2`, `array_filter/2`).
-* Compare equivalent filters before vs after `pivot/3` to inspect generated SQL differences.
-* Add a small challenge section where readers write a target filter and verify the SQL.
+* Add a helper that scores challenge solutions by row-count similarity to a reference query.
+* Add a section on safely parameterizing user-provided filter values.
+* Add a compact table showing filter AST (`query.set.filtered`) next to generated SQL.

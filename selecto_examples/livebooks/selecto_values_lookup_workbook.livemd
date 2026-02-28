@@ -164,6 +164,22 @@ defmodule ValuesLab.Helpers do
         failure
     end
   end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape", pretty: true)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
 end
 ```
 
@@ -299,10 +315,146 @@ end)
 :ok
 ```
 
+## 5) Staged Lookup Logic with `with_values/3` + `with_cte/4`
+
+Build a high-value-order CTE, then enrich those rows with inline status-group metadata.
+
+```elixir
+staged_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "status", "total"])
+    |> Selecto.filter({"total", {:>=, 150}})
+  end, columns: ["id", "status", "total"])
+  |> Selecto.with_values(
+    [
+      ["processing", "In-flight"],
+      ["shipped", "In-flight"],
+      ["delivered", "Closed"],
+      ["cancelled", "Closed"]
+    ],
+    columns: ["status", "status_group"],
+    as: "status_group_lookup"
+  )
+  |> Selecto.join(:high_value_orders,
+    source: "high_value_orders",
+    type: :inner,
+    owner_key: :id,
+    related_key: :id,
+    fields: %{
+      id: %{type: :integer},
+      status: %{type: :string},
+      total: %{type: :decimal}
+    }
+  )
+  |> Selecto.join(:status_group_lookup,
+    source: "status_group_lookup",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      status_group: %{type: :string}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "status_group_lookup.status_group",
+    "high_value_orders.total"
+  ])
+  |> Selecto.order_by({"high_value_orders.total", :desc})
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("CTE + VALUES staged lookup", staged_lookup_query, 10)
+```
+
+## 6) Priority-Scored Business Sorting
+
+Inline lookup rank controls display order first, then monetary value breaks ties.
+
+```elixir
+priority_scored_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", business_rank: 1, board_bucket: "Needs attention"},
+      %{status: "shipped", business_rank: 2, board_bucket: "In transit"},
+      %{status: "delivered", business_rank: 3, board_bucket: "Completed"},
+      %{status: "cancelled", business_rank: 4, board_bucket: "Closed exception"}
+    ],
+    as: "status_business_priority"
+  )
+  |> Selecto.join(:status_business_priority,
+    source: "status_business_priority",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      business_rank: %{type: :integer},
+      board_bucket: %{type: :string}
+    }
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "status_business_priority.business_rank",
+    "status_business_priority.board_bucket",
+    "total"
+  ])
+  |> Selecto.order_by({"status_business_priority.business_rank", :asc})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(20)
+
+ValuesLab.Helpers.run("Business-priority ordering via VALUES", priority_scored_query, 10)
+```
+
+## 7) Shaped Lookup Payloads with `select_shape/2`
+
+Package lookup-enriched values into nested tuples for API-ready output structures.
+
+```elixir
+shaped_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", priority_rank: 3, customer_label: "Open"},
+      %{status: "shipped", priority_rank: 2, customer_label: "On The Way"},
+      %{status: "delivered", priority_rank: 1, customer_label: "Complete"},
+      %{status: "cancelled", priority_rank: 4, customer_label: "Cancelled"}
+    ],
+    as: "status_priority_shape"
+  )
+  |> Selecto.join(:status_priority_shape,
+    source: "status_priority_shape",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      priority_rank: %{type: :integer},
+      customer_label: %{type: :string}
+    }
+  )
+  |> Selecto.select(["order_number", "status", "total"])
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "status_priority_shape.customer_label"},
+    {"status_priority_shape.priority_rank", "total"}
+  ])
+  |> Selecto.order_by({"status_priority_shape.priority_rank", :asc})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run_shape("Shaped VALUES lookup output", shaped_lookup_query, 10)
+```
+
 ## Next Steps
 
 To extend this workbook, add:
 
-1. A section combining `with_values/3` and `with_cte/4` for staged lookup logic
-2. Priority-scored sorting where inline lookup controls business display order
-3. A `select_shape/2` output version for nested lookup payloads
+1. Inline lookup versioning patterns (swap lookup sets by environment)
+2. A workbook cell comparing VALUES lookup versus persisted lookup-table joins
+3. A reusable helper that composes `with_values` + join definitions from a single metadata map

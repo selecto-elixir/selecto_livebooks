@@ -216,6 +216,22 @@ defmodule JsonLab.Helpers do
         failure
     end
   end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape", pretty: true)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
 end
 ```
 
@@ -300,10 +316,104 @@ combined_json_query =
 JsonLab.Helpers.run("Combined JSON + relational query", combined_json_query)
 ```
 
+## 5) JSON Path Existence and Path-Match Filters
+
+Use JSON existence checks for optional keys, then add path-based value matching.
+
+```elixir
+optional_key_seed =
+  config.repo.query!("""
+  UPDATE products
+  SET metadata =
+    CASE
+      WHEN featured THEN jsonb_set(
+        coalesce(metadata, '{}'::jsonb),
+        '{promo_code}',
+        to_jsonb(concat('PROMO-', id::text)),
+        true
+      )
+      ELSE coalesce(metadata, '{}'::jsonb) - 'promo_code'
+    END
+  """)
+
+IO.puts("Optional promo_code keys refreshed: #{optional_key_seed.num_rows}")
+
+json_existence_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price", "featured"])
+  |> Selecto.json_select([
+    {:json_extract_text, "metadata", "$.promo_code", as: "promo_code"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", as: "warehouse_zone"}
+  ])
+  |> Selecto.json_filter([
+    {:json_path_exists, "metadata", "$.promo_code"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", {:=, "in_stock"}}
+  ])
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(10)
+
+JsonLab.Helpers.run("JSON path existence + path match", json_existence_query)
+```
+
+## 6) JSON Filter vs Relational Filter (Same Rule)
+
+`price_band = premium` was seeded from `price >= 100`. This section compares JSON and relational implementations of the same business rule.
+
+```elixir
+premium_by_json_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.json_select([{:json_extract_text, "metadata", "$.price_band", as: "price_band"}])
+  |> Selecto.json_filter({:json_contains, "metadata", %{"price_band" => "premium"}})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(20)
+
+premium_by_relational_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.filter({"price", {:>=, 100}})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(20)
+
+{:ok, {json_rows, _, _}} = JsonLab.Helpers.run("Premium by JSON price_band", premium_by_json_query, 5)
+{:ok, {rel_rows, _, _}} = JsonLab.Helpers.run("Premium by relational price threshold", premium_by_relational_query, 5)
+
+IO.puts("JSON rows: #{length(json_rows)}")
+IO.puts("Relational rows: #{length(rel_rows)}")
+IO.puts("Counts match? #{length(json_rows) == length(rel_rows)}")
+```
+
+## 7) Shaped Output with `json_select/2` + `select_shape/2`
+
+Project JSON-derived columns and package them into nested output tuples for structured rendering.
+When shaping, use explicit field selectors for JSON paths (rather than alias-only names) so field resolution remains valid.
+
+```elixir
+json_shaped_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(["name", "sku", "price"])
+  |> Selecto.json_select([
+    {:json_extract_text, "metadata", "$.price_band", as: "price_band"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", as: "warehouse_zone"}
+  ])
+  |> Selecto.select_shape([
+    "name",
+    {"sku", "price"},
+    {
+      {:field, "metadata.price_band", "price_band"},
+      {:field, "metadata.warehouse.zone", "warehouse_zone"}
+    }
+  ])
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(10)
+
+JsonLab.Helpers.run_shape("Shaped JSON projection", json_shaped_query, 10)
+```
+
 ## Next Steps
 
 To extend this workbook, add:
 
-1. JSON existence and path-match examples for optional metadata keys
-2. A section comparing JSON filtering vs normalized-table filtering for the same business rule
-3. A shaped-output section combining `json_select` with `select_shape/2`
+1. JSON aggregation examples (`json_agg`, `json_object_agg`) grouped by category or supplier
+2. A mixed JSON + window-function section for ranked metadata cohorts
+3. A compact Kino table section for side-by-side JSON and relational query result comparison
