@@ -1,0 +1,157 @@
+# Your First Selecto Query: Domains, Parameters, and Automatic Joins
+
+Start here before the long guide. In about ten minutes you will compile a
+query, see exactly when a join is needed, and keep external values out of SQL.
+No database, Ecto Repo, migrations, or seed data are needed. Assertions make
+the expected behavior executable, rather than relying on printed SQL alone.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Describe the data once
+
+The application owns the tables, keys, and allowed relationship paths. An
+association describes how to reach a table; declaring it does **not** mean
+every query joins that table. This small domain deliberately has two joins.
+
+```elixir
+import ExUnit.Assertions
+
+domain = %{
+  name: "First orders",
+  source: %{
+    source_table: "orders",
+    primary_key: :id,
+    fields: [:id, :status, :customer_id, :warehouse_id],
+    redact_fields: [],
+    columns: %{
+      id: %{type: :integer},
+      status: %{type: :string},
+      customer_id: %{type: :integer},
+      warehouse_id: %{type: :integer}
+    },
+    associations: %{
+      customer: %{queryable: :customers, field: :customer, owner_key: :customer_id, related_key: :id},
+      warehouse: %{queryable: :warehouses, field: :warehouse, owner_key: :warehouse_id, related_key: :id}
+    }
+  },
+  schemas: Map.new([:customers, :warehouses], fn table ->
+    {table, %{
+      source_table: Atom.to_string(table),
+      primary_key: :id,
+      fields: [:id, :name],
+      redact_fields: [],
+      columns: %{id: %{type: :integer}, name: %{type: :string}},
+      associations: %{}
+    }}
+  end),
+  joins: %{customer: %{type: :left}, warehouse: %{type: :left}}
+}
+
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only)
+base = Selecto.configure(domain, runtime)
+```
+
+The explicit runtime chooses the SQL dialect and adapter. `:compile_only` is
+an opaque placeholder for this example, **not** a connection you can execute
+against. A live application supplies its adapter-owned connection handle.
+
+## 2) Compose, then compile
+
+Query construction is immutable. Reuse `base` for independent branches.
+`to_sql/1` compiles but does not run the query; filters carry bound values.
+
+```elixir
+open_orders =
+  base
+  |> Selecto.select(["id", "status"])
+  |> Selecto.filter({"status", "open"})
+  |> Selecto.order_by({"id", :asc})
+  |> Selecto.limit(10)
+
+{sql, params} = Selecto.to_sql(open_orders)
+assert params == ["open"]
+assert sql =~ "$1"
+refute sql =~ "'open'"
+refute sql =~ ~r/\bjoin\b/i
+assert base.set.filtered == []
+%{sql: sql, params: params}
+```
+
+## 3) Requesting related data selects the join
+
+There is no separate join list to keep in sync with the projection. Selecting
+`customer.name` activates the customer path, but not the warehouse path.
+
+```elixir
+with_customer = Selecto.select(open_orders, ["customer.name"])
+{customer_sql, customer_params} = Selecto.to_sql(with_customer)
+assert customer_sql =~ ~r/\bjoin\s+customers\b/i
+refute customer_sql =~ ~r/\bjoin\s+warehouses\b/i
+assert customer_params == ["open"]
+{unchanged_sql, _} = Selecto.to_sql(open_orders)
+refute unchanged_sql =~ ~r/\bjoin\b/i
+%{sql: customer_sql, params: customer_params}
+```
+
+## 4) A join can be needed without selecting its columns
+
+Related fields in filters and ordering also need their joins. In a real
+query, removing a visible column is not enough to remove a join if another
+clause still references that relationship.
+
+```elixir
+filter_only =
+  base
+  |> Selecto.select(["id"])
+  |> Selecto.filter({"customer.name", "Ada"})
+
+order_only =
+  base
+  |> Selecto.select(["id"])
+  |> Selecto.order_by([{"customer.name", :asc}, {"id", :asc}])
+
+for query <- [filter_only, order_only] do
+  {clause_sql, _params} = Selecto.to_sql(query)
+  assert clause_sql =~ ~r/\bjoin\s+customers\b/i
+  refute clause_sql =~ ~r/\bjoin\s+warehouses\b/i
+end
+```
+
+A left join followed by a non-null customer predicate can exclude unmatched
+orders. Also, selecting a to-many relationship can multiply root rows. Use
+[selection shapes/subselects](selecto_selection_shapes_subselects_retargets.livemd)
+when you need one order with a collection of line items, rather than a flat
+order-item row for every match.
+
+## 5) Values and identifiers are different boundaries
+
+This deliberately hostile **value** must remain a parameter. Parameterization
+does not decide whether a value is meaningful or authorized for your app.
+Keep user-selected fields/orderings behind an application allowlist too.
+
+```elixir
+external_status = "open' OR 1=1 --"
+{safe_sql, safe_params} =
+  base
+  |> Selecto.select(["id"])
+  |> Selecto.filter({"status", external_status})
+  |> Selecto.to_sql()
+
+assert safe_params == [external_status]
+refute safe_sql =~ external_status
+
+allowed_sorts = %{"oldest" => {"id", :asc}, "newest" => {"id", :desc}}
+assert {:ok, {"id", :desc}} = Map.fetch(allowed_sorts, "newest")
+assert :error = Map.fetch(allowed_sorts, "id; DROP TABLE orders")
+```
+
+No arbitrary field name becomes an atom or SQL fragment. For a sealed query
+boundary, continue with [strict mode](selecto_strict_mode_workbook.livemd).
+For a real database-backed application flow, next try
+[pagination](selecto_pagination_workbook.livemd) and
+[tenant-scoped reads](selecto_tenant_reads_workbook.livemd).

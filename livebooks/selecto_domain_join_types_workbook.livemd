@@ -1,0 +1,510 @@
+# Selecto Domain Join Types Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook explores advanced domain-level join intent markers.
+
+1. `:star_dimension` for OLAP-like aggregate semantics
+2. `:snowflake_dimension` for normalized dimension chains
+3. Hierarchical markers (`:adjacency_list`, `:materialized_path`, `:closure_table`)
+4. Metadata and SQL differences for the same logical query
+
+```mermaid
+flowchart LR
+  base[Base domain join]
+  marker[Join type marker]
+  planner[Selecto planner]
+  sql[Generated SQL + metadata]
+
+  base --> marker --> planner --> sql
+```
+
+```mermaid
+graph TD
+  fact[orders fact]
+  customer[customer dimension]
+  snow[snowflake normalization]
+  hier[hierarchical join family]
+
+  fact --> customer
+  customer --> snow
+  customer --> hier
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Shared Repo and Load Base Domains
+
+This cell starts the shared sample-app repo and loads the maintained order and
+employee domains for join-type variants.
+
+```elixir
+config = SelectoLivebooks.NotebookSupport.config([:order_domain, :employee_domain])
+counts = SelectoLivebooks.NotebookSupport.table_counts(["orders", "employees"])
+order_count = counts["orders"]
+employee_count = counts["employees"]
+
+IO.puts("Connected. Orders: #{order_count}, Employees: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define Join-Type Helper
+
+This helper prints SQL and optionally executes the query.
+
+```elixir
+import Selecto.ExprMacros
+
+defmodule JoinTypeLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+
+  def run(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+end
+```
+
+## 1) `:star_dimension` Marker
+
+Switch only the customer join type marker and run an aggregate query.
+
+```elixir
+olap_domain =
+  put_in(config.order_domain, [:joins, :customer, :type], :star_dimension)
+
+olap_query =
+  Selecto.configure(olap_domain, config.repo)
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(10)
+
+JoinTypeLab.Helpers.run("Star dimension marker", olap_query)
+```
+
+## 2) `:snowflake_dimension` Marker
+
+Apply the snowflake marker and normalization chain while keeping query API usage unchanged.
+
+```elixir
+snowflake_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    config.order_domain.joins.customer
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+snowflake_selecto = Selecto.configure(snowflake_domain, config.repo)
+snowflake_join = Selecto.joins(snowflake_selecto)[:customer]
+
+snowflake_query =
+  snowflake_selecto
+  |> Selecto.select(["customer.name", {:count, "*"}, {:sum, "total"}])
+  |> Selecto.group_by(["customer.name"])
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(10)
+
+IO.puts("Join metadata marker: #{inspect(snowflake_join.join_type)}")
+JoinTypeLab.Helpers.run("Snowflake dimension marker", snowflake_query)
+```
+
+## 3) Side-by-Side Marker Comparison (`:left`, `:star_dimension`, `:snowflake_dimension`)
+
+Keep the same select/filter/order query and compare SQL + metadata by marker only.
+
+```elixir
+base_customer_join = config.order_domain.joins.customer
+
+regular_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.put(:type, :left)
+  )
+
+star_domain =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{type: :star_dimension, display_field: :name})
+  )
+
+snowflake_domain_compare =
+  put_in(config.order_domain, [:joins, :customer],
+    base_customer_join
+    |> Map.merge(%{
+      type: :snowflake_dimension,
+      display_field: :name,
+      normalization_joins: [
+        %{table: "customers", key: "id", foreign_key: "id", alias: "customer_customers"}
+      ]
+    })
+  )
+
+build_query = fn selecto ->
+  selecto
+  |> Selecto.select(["order_number", "customer.name", "total"])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(5)
+end
+
+Enum.each(
+  [
+    {"Regular (:left)", regular_domain},
+    {"Star (:star_dimension)", star_domain},
+    {"Snowflake (:snowflake_dimension)", snowflake_domain_compare}
+  ],
+  fn {label, domain} ->
+    selecto = Selecto.configure(domain, config.repo)
+    query = build_query.(selecto)
+    {_sql, _params} = JoinTypeLab.Helpers.explain(label, query)
+    join_meta = Selecto.joins(selecto)[:customer]
+    IO.puts("join_type metadata: #{inspect(Map.get(join_meta, :join_type, :basic))}")
+  end
+)
+
+:ok
+```
+
+## 4) Hierarchical Marker Metadata Preview
+
+Preview metadata and generated field surfaces for three hierarchy styles without requiring all physical schema artifacts.
+
+```elixir
+hierarchy_base =
+  config.employee_domain
+  |> put_in([:source, :associations, :manager_tree], %{
+    field: :manager_tree,
+    queryable: :employees,
+    owner_key: :manager_id,
+    related_key: :id
+  })
+
+hierarchy_variants = [
+  {
+    :adjacency_list,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :adjacency_list,
+      depth_limit: 5,
+      id_field: :id,
+      parent_field: :manager_id,
+      name_field: :first_name,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :materialized_path,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :materialized_path,
+      path_field: :manager_path,
+      path_separator: "/",
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  },
+  {
+    :closure_table,
+    %{
+      name: "Manager Tree",
+      type: :hierarchical,
+      hierarchy_type: :closure_table,
+      closure_table: "employee_closure",
+      ancestor_field: :ancestor_id,
+      descendant_field: :descendant_id,
+      depth_field: :depth,
+      fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+    }
+  }
+]
+
+Enum.each(hierarchy_variants, fn {label, join_config} ->
+  domain = put_in(hierarchy_base, [:joins, :manager_tree], join_config)
+
+  try do
+    selecto = Selecto.configure(domain, config.repo)
+    join_meta = Selecto.joins(selecto)[:manager_tree]
+
+    hierarchy_fields =
+      selecto
+      |> Selecto.columns()
+      |> Map.keys()
+      |> Enum.filter(&String.contains?(&1, "manager_tree"))
+      |> Enum.sort()
+      |> Enum.take(12)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts("join_type: #{inspect(join_meta.join_type)}")
+    IO.puts("hierarchy_depth: #{inspect(Map.get(join_meta, :hierarchy_depth))}")
+    IO.puts("path_field: #{inspect(Map.get(join_meta, :path_field))}")
+    IO.puts("closure_table: #{inspect(Map.get(join_meta, :closure_table))}")
+    IO.puts("field preview: #{inspect(hierarchy_fields)}")
+  rescue
+    e ->
+      IO.puts("\n=== #{label} ===")
+      IO.puts("Hierarchy preview failed: #{Exception.message(e)}")
+  end
+end)
+
+:ok
+```
+
+## 5) Adjacency Query Runtime (`:adjacency_list`)
+
+Run a small adjacency-list hierarchy query against the sample dataset.
+
+```elixir
+adjacency_domain =
+  hierarchy_base
+  |> put_in([:joins, :manager_tree], %{
+    name: "Manager Tree",
+    type: :hierarchical,
+    hierarchy_type: :adjacency_list,
+    depth_limit: 5,
+    id_field: :id,
+    parent_field: :manager_id,
+    name_field: :first_name,
+    fields: %{first_name: %{type: :string}, last_name: %{type: :string}}
+  })
+
+adjacency_query =
+  Selecto.configure(adjacency_domain, config.repo)
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_tree.first_name",
+    "manager_tree_level",
+    "manager_tree_path"
+  ])
+  |> Selecto.limit(15)
+
+JoinTypeLab.Helpers.run("Adjacency hierarchy runtime", adjacency_query)
+```
+
+## 7) Snowflake Normalization Chains
+
+Build a reporting query that walks from orders through customer and geography
+style dimensions without flattening the domain definition into one table.
+
+```elixir
+snowflake_chain_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([
+    order_number,
+    customer.name,
+    customer.tier,
+    customer.country,
+    shipping_country,
+    total
+  ]))
+  |> Selecto.filter(where(customer.active == true))
+  |> Selecto.order_by(order_by([asc(customer.country), desc(total)]))
+  |> Selecto.limit(20)
+
+JoinTypeLab.Helpers.run("Snowflake-style customer geography chain", snowflake_chain_query)
+```
+
+## 8) Compare SQL Plans Between Join Markers
+
+Run `EXPLAIN` for representative join-marker queries and compare their top-level
+plan text.
+
+```elixir
+plan_rows =
+  [
+    {"snowflake", snowflake_chain_query},
+    {"adjacency", adjacency_query}
+  ]
+  |> Enum.map(fn {label, query} ->
+    case Selecto.explain(query, format: :text) do
+      {:ok, %{plan_lines: plan_lines}} ->
+        %{label: label, plan: Enum.join(plan_lines, "\n")}
+
+      {:error, error} ->
+        %{label: label, plan: inspect(error)}
+    end
+  end)
+
+Kino.DataTable.new(plan_rows)
+```
+
+## 9) Hierarchy Reporting with Window Functions
+
+Combine hierarchy-derived fields with a window rank to create an org-reporting
+slice.
+
+```elixir
+hierarchy_rank_query =
+  adjacency_query
+  |> Selecto.window_function(:row_number, [],
+    over: [order_by: [{"last_name", :asc}]],
+    as: "level_name_rank"
+  )
+  |> Selecto.order_by({"manager_tree_level", :asc})
+  |> Selecto.order_by({"last_name", :asc})
+  |> Selecto.limit(30)
+
+JoinTypeLab.Helpers.run("Hierarchy marker with level rank", hierarchy_rank_query)
+```
+
+## 10) Join Marker Configuration Matrix
+
+Put marker configuration maps side by side when choosing between ordinary joins,
+snowflake chains, and adjacency hierarchies.
+
+```elixir
+join_marker_matrix =
+  [
+    %{marker: "ordinary", source: "customers", relationship: "orders.customer_id -> customers.id", generated_fields: "joined table fields"},
+    %{marker: "snowflake", source: "manager chain", relationship: "employee.manager_id -> manager.id", generated_fields: "each configured hop"},
+    %{marker: "adjacency", source: "employees", relationship: "id -> manager_id recursively", generated_fields: "level, path, root"}
+  ]
+
+Kino.DataTable.new(join_marker_matrix)
+```
+
+## 11) Hierarchy Rollups
+
+Aggregate an adjacency-style employee tree to see how many people appear at each
+reporting depth.
+
+```elixir
+{:ok, hierarchy_rollup} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH RECURSIVE manager_tree AS (
+    SELECT id, manager_id, department, 0 AS level
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT employee.id, employee.manager_id, employee.department, manager_tree.level + 1
+    FROM employees employee
+    JOIN manager_tree ON employee.manager_id = manager_tree.id
+  )
+  SELECT department, level, count(*) AS employee_count
+  FROM manager_tree
+  GROUP BY department, level
+  ORDER BY department, level
+  """, [])
+
+hierarchy_rollup.rows
+```
+
+## 12) Missing Marker Field Troubleshooting
+
+Use this checklist when a marker-generated field does not appear where a query
+expects it.
+
+```elixir
+expected_marker_fields = ["manager_tree_level", "manager_tree_path", "manager_tree_root_id"]
+selected_fields = ["id", "first_name", "last_name", "manager_tree_level"]
+
+expected_marker_fields
+|> Enum.map(fn field ->
+  %{
+    field: field,
+    selected?: field in selected_fields,
+    next_check:
+      if(field in selected_fields,
+        do: "field selected; inspect SQL alias",
+        else: "add field to select list or marker projection"
+      )
+  }
+end)
+|> Kino.DataTable.new()
+```
+
+## 13) Marker Matrix from Domain Metadata
+
+Generate the marker overview from the domain maps instead of hand-maintaining
+the comparison table.
+
+```elixir
+marker_metadata_rows =
+  config.employee_domain.joins
+  |> Enum.map(fn {join_id, join_config} ->
+    %{
+      join_id: join_id,
+      type: Map.get(join_config, :type),
+      source: Map.get(join_config, :source),
+      owner_key: inspect(Map.get(join_config, :owner_key) || get_in(join_config, [:on, Access.at(0), :left])),
+      related_key: inspect(Map.get(join_config, :related_key) || get_in(join_config, [:on, Access.at(0), :right]))
+    }
+  end)
+
+Kino.DataTable.new(marker_metadata_rows)
+```
+
+## 14) Hierarchy Depth Rollups Over Time
+
+Bucket employees by hierarchy depth and hire year to inspect reporting-shape
+changes over time.
+
+```elixir
+{:ok, depth_over_time} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH RECURSIVE manager_tree AS (
+    SELECT id, manager_id, hire_date, 0 AS level
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT employee.id, employee.manager_id, employee.hire_date, manager_tree.level + 1
+    FROM employees employee
+    JOIN manager_tree ON employee.manager_id = manager_tree.id
+  )
+  SELECT level, date_part('year', hire_date)::int AS hire_year, count(*) AS employee_count
+  FROM manager_tree
+  GROUP BY level, hire_year
+  ORDER BY level, hire_year
+  """, [])
+
+depth_over_time.rows
+```
+
+## 15) Marker Alias Mistake Pair
+
+Keep failing and fixed field paths side by side so readers can spot alias
+mistakes before executing a query.
+
+```elixir
+alias_examples = [
+  %{state: "failing", field: "manager_tree.level", reason: "uses dot path that is not a selected marker alias"},
+  %{state: "fixed", field: "manager_tree_level", reason: "uses generated marker field name"}
+]
+
+Kino.DataTable.new(alias_examples)
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+1. Add marker metadata extraction for snowflake and adjacency examples separately
+2. Add department-level hierarchy rollups with chart-ready maps
+3. Add an executable fixed-query cell for each alias troubleshooting row

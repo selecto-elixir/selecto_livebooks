@@ -1,0 +1,733 @@
+# Selecto Filtering System Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This notebook exercises the Selecto filtering system with practical patterns:
+
+1. Equality and comparison filters
+2. Membership and range filters
+3. String and case-insensitive filters
+4. Null and not-null filters
+5. Nested logical composition (`:and`, `:or`, `:not`)
+6. Join-aware filters across related tables
+7. Composable filters across multiple `filter/2` calls
+8. Subquery filters
+
+```mermaid
+flowchart LR
+  base[Configure query] --> filters[Add filters]
+  filters --> sql[Inspect SQL and params]
+  sql --> exec[Execute]
+  exec --> rows[Review rows]
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Shared Repo and Load Domains
+
+This cell starts the shared sample-app repo and loads maintained domain modules
+from `selecto_livebooks`.
+
+```elixir
+config = SelectoLivebooks.NotebookSupport.config([:order_domain, :product_domain])
+order_count = SelectoLivebooks.NotebookSupport.table_counts(["orders"])["orders"]
+
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+## Setup 3) Define Filter Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule FilteringLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+
+  def run(label, query, preview_count \\ 5) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+The first sections now use the shipped expression DSL (`Selecto.ExprMacros` and
+`~SELECTO`) where it improves readability. Later cells still keep tuple forms
+when they better expose lower-level filter shapes.
+
+```elixir
+import Selecto.ExprMacros
+import Selecto.Sigil
+
+alias Selecto.Expr, as: X
+
+:ok
+```
+
+## 1) Equality and Comparison Filters
+
+Use direct equality and numeric comparisons to narrow results quickly.
+
+```elixir
+import Selecto.ExprMacros
+
+basic_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total, shipping_country]))
+  |> Selecto.filter(where(status == "delivered" and total > 100))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Equality + comparison", basic_filter_query)
+```
+
+## 2) Membership and Range Filters
+
+Use `:in`, `:not_in`, and `:between` for set-based and bounded filtering.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+statuses = ["processing", "shipped", "delivered"]
+
+membership_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([id, order_number, status, total]))
+  |> Selecto.filter(X.in("status", statuses))
+  |> Selecto.filter(where(id >= 1 and id <= 50))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Membership + range", membership_query)
+
+not_in_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.filter(where(not_in(status, ["cancelled", "returned"])))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Not-in filter", not_in_query)
+```
+
+## 3) String Filters (`:like`, `:ilike`)
+
+Pattern matching works across source and joined fields.
+
+```elixir
+import Selecto.ExprMacros
+import Selecto.Sigil
+
+name_pattern = "%a%"
+country_pattern = "%U%"
+
+string_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name, shipping_country]))
+  |> Selecto.filter(~SELECTO"case_insensitive_like(customer.name, ^name_pattern) or like(shipping_country, ^country_pattern)")
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("String pattern filters", string_filter_query)
+```
+
+## 4) Null and Not-Null Filters
+
+Use `nil` for `IS NULL` and `:not_null` for `IS NOT NULL`.
+
+```elixir
+import Selecto.ExprMacros
+
+null_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, shipped_at, delivered_at]))
+  |> Selecto.filter(where(not is_nil(shipped_at) and is_nil(delivered_at)))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Null checks", null_filter_query)
+```
+
+## 5) Nested Logical Composition (`:and`, `:or`, `:not`)
+
+Build expressive boolean logic trees with nested operators.
+
+```elixir
+import Selecto.ExprMacros
+
+logical_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total, customer.tier, shipping_country]))
+  |> Selecto.filter(
+    where(total >= 50 and (status == "processing" or status == "shipped") and shipping_country != "Antarctica")
+  )
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Nested logical filters", logical_filter_query)
+```
+
+## 6) Join-Aware Filters
+
+Filter on joined table fields without manually writing JOIN clauses.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+join_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name, customer.tier, order_items.quantity, order_items.line_total]))
+  |> Selecto.filter(X.in("customer.tier", ["gold", "platinum", "premium"]))
+  |> Selecto.filter(where(order_items.quantity > 1))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Join-aware filters", join_filter_query)
+```
+
+## 7) Composable Filters Across Multiple `filter/2` Calls
+
+`filter/2` is composable. Build a base query, then layer constraints incrementally.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+base_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total, shipping_country]))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(10)
+
+geo_filtered_query =
+  base_query
+  |> Selecto.filter(X.in("shipping_country", ["USA", "Canada", "UK"]))
+
+status_filtered_query =
+  geo_filtered_query
+  |> Selecto.filter(where(not_in(status, ["cancelled"])))
+
+composable_filter_query =
+  status_filtered_query
+  |> Selecto.filter(where(total >= 75))
+
+IO.inspect(composable_filter_query.set.filtered, label: "Accumulated filters")
+
+FilteringLab.Helpers.run("Composable multi-stage filters", composable_filter_query)
+```
+
+## 8) Subquery Filters
+
+Use `{:subquery, :in, query}` with a composed Selecto subquery.
+
+```elixir
+customer_subquery_domain = %{
+  name: "Customers",
+  source: config.order_domain.schemas.customers |> Map.put_new(:associations, %{}),
+  schemas: %{},
+  joins: %{}
+}
+
+eligible_customers_subquery =
+  Selecto.configure(customer_subquery_domain, config.repo)
+  |> Selecto.select(["id"])
+  |> Selecto.filter({"tier", {:in, ["gold", "platinum"]}})
+
+subquery_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(["order_number", "status", "total", "customer.name", "customer.tier"])
+  |> Selecto.filter({"customer_id", {:subquery, :in, eligible_customers_subquery}})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Subquery filter", subquery_filter_query)
+```
+
+## 9) JSON and Array-Specific Filters
+
+This section adds a product-focused domain so you can combine `json_filter/2` and `array_filter/2` in one query.
+
+```elixir
+product_filter_domain = %{
+  name: "Products",
+  source: %{
+    source_table: "products",
+    primary_key: :id,
+    fields: [:id, :name, :price, :stock_quantity, :reorder_level, :active, :tags, :metadata],
+    columns: %{
+      id: %{type: :integer},
+      name: %{type: :string},
+      price: %{type: :decimal},
+      stock_quantity: %{type: :integer},
+      reorder_level: %{type: :integer},
+      active: %{type: :boolean},
+      tags: %{type: {:array, :string}},
+      metadata: %{type: :jsonb}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  joins: %{}
+}
+
+metadata_refresh =
+  config.repo.query!("""
+  UPDATE products
+  SET metadata = jsonb_build_object(
+    'price_band',
+    CASE
+      WHEN price >= 100 THEN 'premium'
+      WHEN price >= 50 THEN 'mid'
+      ELSE 'budget'
+    END,
+    'warehouse',
+    jsonb_build_object(
+      'zone',
+      CASE WHEN stock_quantity <= reorder_level THEN 'restock' ELSE 'in_stock' END
+    ),
+    'flags',
+    jsonb_build_array(
+      CASE WHEN active THEN 'active' ELSE 'inactive' END,
+      CASE WHEN coalesce(array_length(tags, 1), 0) > 0 THEN 'has_tags' ELSE 'untagged' END
+    )
+  )
+  """)
+
+IO.puts("Product metadata refreshed for filter demo: #{metadata_refresh.num_rows}")
+
+json_array_filter_query =
+  Selecto.configure(product_filter_domain, config.repo)
+  |> Selecto.select(["name", "price", "tags", "active"])
+  |> Selecto.json_select([
+    {:json_extract_text, "metadata", "$.price_band", as: "price_band"},
+    {:json_extract_text, "metadata", "$.warehouse.zone", as: "warehouse_zone"}
+  ])
+  |> Selecto.json_filter([
+    {:json_contains, "metadata", %{"warehouse" => %{"zone" => "in_stock"}}}
+  ])
+  |> Selecto.array_filter({:array_overlap, "tags", ["electronics", "outdoor", "mobile"]})
+  |> Selecto.order_by({"price", :desc})
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("JSON + array filters", json_array_filter_query)
+```
+
+## 10) Pre- vs Post-Retarget Filters
+
+Compare pre-retarget and post-retarget filtering behavior and inspect the resulting SQL.
+For the current Selecto build, post-retarget filters should target the retarget root field name directly (for example `"quantity"`), so this example uses `Selecto.post_retarget_filter/2`.
+
+```elixir
+import Selecto.ExprMacros
+
+retarget_pre_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.select(select([order_items.product_id, order_items.quantity, order_items.line_total]))
+  |> Selecto.limit(10)
+
+retarget_pre_and_post_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.post_retarget_filter({"quantity", 2})
+  |> Selecto.select(select([order_items.product_id, order_items.quantity, order_items.line_total]))
+  |> Selecto.limit(10)
+
+retarget_post_only_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists, preserve_filters: false)
+  |> Selecto.post_retarget_filter({"quantity", 2})
+  |> Selecto.select(select([order_items.product_id, order_items.quantity, order_items.line_total]))
+  |> Selecto.limit(10)
+
+for {label, query} <- [
+      {"Pre-retarget filter only", retarget_pre_filter_query},
+      {"Pre + post retarget filters", retarget_pre_and_post_filter_query},
+      {"Post-retarget only (preserve_filters: false)", retarget_post_only_query}
+    ] do
+  {sql, _params} = Selecto.to_sql(query)
+  sql_downcase = String.downcase(sql)
+
+  IO.puts("\n#{label}")
+  IO.puts("Contains status predicate? #{String.contains?(sql_downcase, "status")}")
+  IO.puts("Contains quantity predicate? #{String.contains?(sql_downcase, "quantity")}")
+
+  FilteringLab.Helpers.run(label, query, 5)
+end
+
+:ok
+```
+
+## 11) Filter Challenge: Build and Verify SQL
+
+Edit the challenge builder to meet the goal, then use SQL fragment checks to confirm the query includes each required condition.
+
+```elixir
+import Selecto.ExprMacros
+
+challenge_goal = """
+Return delivered or shipped orders to USA/Canada with total >= 120,
+sorted by total descending.
+"""
+
+IO.puts("Challenge goal: " <> String.trim(challenge_goal))
+
+challenge_query_builder = fn ->
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, shipping_country, total]))
+  |> Selecto.filter(
+    where(
+      (status == "delivered" or status == "shipped") and
+        (shipping_country == "USA" or shipping_country == "Canada") and total >= 120
+    )
+  )
+  |> Selecto.order_by(order_by([desc(total), asc(id)]))
+  |> Selecto.limit(10)
+end
+
+challenge_query = challenge_query_builder.()
+{challenge_sql, _challenge_params} = Selecto.to_sql(challenge_query)
+challenge_sql_downcase = String.downcase(challenge_sql)
+
+required_fragments = ["status", "shipping_country", "total", "order by", "limit"]
+
+fragment_checks =
+  Enum.map(required_fragments, fn fragment ->
+    {fragment, String.contains?(challenge_sql_downcase, fragment)}
+  end)
+
+IO.inspect(fragment_checks, label: "SQL fragment checks")
+IO.puts("All checks pass? #{Enum.all?(fragment_checks, fn {_f, ok?} -> ok? end)}")
+
+FilteringLab.Helpers.run("Challenge query", challenge_query, 10)
+```
+
+## 12) Compare Challenge Results, Not Just Row Counts
+
+Equal row counts can hide completely different answers. Compare column order
+and row multisets (including duplicate multiplicity) without requiring exact
+SQL text. This intentionally ignores row ordering; test ordering separately
+when it is part of the result contract. Matching this fixture does not prove
+equivalence for every possible dataset.
+
+```elixir
+defmodule FilteringLab.ChallengeScoring do
+  @moduledoc false
+
+  def score(reference_query, learner_query) do
+    {:ok, reference_result} = Selecto.execute(reference_query)
+    {:ok, learner_result} = Selecto.execute(learner_query)
+    compare(reference_result, learner_result)
+  end
+
+  def compare({reference_rows, reference_columns, _}, {learner_rows, learner_columns, _}) do
+    %{
+      reference_rows: length(reference_rows),
+      learner_rows: length(learner_rows),
+      same_columns?: reference_columns == learner_columns,
+      same_row_multiset?: Enum.frequencies(reference_rows) == Enum.frequencies(learner_rows)
+    }
+  end
+end
+
+reference_challenge_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, shipping_country, total]))
+  |> Selecto.filter(where(status in ["delivered", "shipped"]))
+  |> Selecto.filter(where(shipping_country in ["USA", "Canada"] and total >= 120))
+  |> Selecto.order_by(order_by([desc(total), asc(id)]))
+  |> Selecto.limit(10)
+
+score = FilteringLab.ChallengeScoring.score(reference_challenge_query, challenge_query)
+true = score.same_columns? and score.same_row_multiset?
+
+# Equal counts and equal distinct sets must not mask the wrong row multiplicity.
+wrong_answer = FilteringLab.ChallengeScoring.compare(
+  {[[1], [1], [2]], ["id"], []}, {[[1], [2], [2]], ["id"], []}
+)
+false = wrong_answer.same_row_multiset?
+true = wrong_answer.reference_rows == wrong_answer.learner_rows
+
+Kino.DataTable.new([score])
+```
+
+## 13) Safely Parameterize User-Provided Filter Values
+
+Validate user input into a small, typed allowlist before it becomes a Selecto
+filter. The filter itself still carries values as parameters instead of SQL
+string interpolation.
+
+```elixir
+allowed_statuses = ["processing", "shipped", "delivered", "cancelled", "returned", "pending"]
+
+user_filter = %{
+  "status" => "delivered",
+  "min_total" => "75",
+  "country" => "United States"
+}
+
+with status <- user_filter["status"],
+     true <- status in allowed_statuses,
+     {min_total, ""} <- Decimal.parse(user_filter["min_total"]),
+     country when byte_size(country) <= 80 <- user_filter["country"] do
+  safe_parameterized_query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([order_number, status, total, shipping_country]))
+    |> Selecto.filter(where(status == ^status))
+    |> Selecto.filter(where(total >= ^min_total))
+    |> Selecto.filter(where(shipping_country == ^country))
+    |> Selecto.order_by(order_by([desc(total)]))
+    |> Selecto.limit(10)
+
+  FilteringLab.Helpers.run("Safely parameterized user filters", safe_parameterized_query)
+else
+  _ -> IO.puts("Rejected unsafe or unsupported filter input")
+end
+```
+
+## 14) Filter AST Next to Generated SQL
+
+For debugging, inspect the internal filter tree and generated SQL together.
+
+```elixir
+filter_debug_rows =
+  [
+    {"basic", basic_filter_query},
+    {"membership", membership_query},
+    {"challenge", challenge_query}
+  ]
+  |> Enum.map(fn {label, query} ->
+    {sql, params} = Selecto.to_sql(query)
+
+    %{
+      label: label,
+      filter_ast: inspect(query.set.filtered, pretty: true, limit: 40),
+      sql: Selecto.format_sql(sql),
+      params: inspect(params)
+    }
+  end)
+
+Kino.DataTable.new(filter_debug_rows)
+```
+
+## 15) Optional Filter Challenge with Match Scoring
+
+Accept optional criteria, apply only the provided filters, and score how many
+criteria each returned row satisfied.
+
+```elixir
+optional_filters = %{
+  "status" => "delivered",
+  "min_total" => Decimal.new("250"),
+  "country" => nil
+}
+
+match_score_sql =
+  "((selecto_root.status = 'delivered')::int + (selecto_root.total >= 250)::int + (selecto_root.shipping_country = 'USA')::int)"
+
+optional_challenge_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> then(fn query ->
+    case optional_filters["status"] do
+      nil -> query
+      status -> Selecto.filter(query, where(status == ^status))
+    end
+  end)
+  |> then(fn query ->
+    case optional_filters["min_total"] do
+      nil -> query
+      min_total -> Selecto.filter(query, where(total >= ^min_total))
+    end
+  end)
+  |> then(fn query ->
+    case optional_filters["country"] do
+      nil -> query
+      country -> Selecto.filter(query, where(shipping_country == ^country))
+    end
+  end)
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "total",
+    "shipping_country",
+    {:field, {:raw_sql, match_score_sql}, "match_score"}
+  ])
+  |> Selecto.order_by({{:raw_sql, match_score_sql}, :desc})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+FilteringLab.Helpers.run("Optional filters with match score", optional_challenge_query, 10)
+```
+
+## 16) Reject Unsupported Field Names First
+
+Validate requested field names before constructing filter expressions. This
+keeps user input out of field paths and raw SQL fragments.
+
+```elixir
+allowed_filter_fields = %{
+  "status" => &where(status == ^&1),
+  "shipping_country" => &where(shipping_country == ^&1)
+}
+
+requested_filters = %{
+  "status" => "shipped",
+  "shipping_country" => "USA",
+  "total; drop table orders" => "nope"
+}
+
+unsupported_fields =
+  requested_filters
+  |> Map.keys()
+  |> Enum.reject(&Map.has_key?(allowed_filter_fields, &1))
+
+if unsupported_fields == [] do
+  requested_filters
+  |> Enum.reduce(Selecto.configure(config.order_domain, config.repo), fn {field, value}, query ->
+    Selecto.filter(query, allowed_filter_fields[field].(value))
+  end)
+  |> Selecto.select(select([order_number, status, shipping_country, total]))
+  |> Selecto.limit(10)
+  |> FilteringLab.Helpers.run("Validated dynamic field filters", 10)
+else
+  IO.puts("Rejected unsupported fields: #{Enum.join(unsupported_fields, ", ")}")
+end
+```
+
+## 17) Equivalent DSL, Sigil, and Tuple Filters
+
+Compare three ways to express the same country filter and inspect the generated
+SQL shape.
+
+```elixir
+country_value = "USA"
+
+equivalent_filter_queries = [
+  {"macro DSL",
+   Selecto.configure(config.order_domain, config.repo)
+   |> Selecto.filter(where(shipping_country == ^country_value))
+   |> Selecto.select(select([order_number, shipping_country]))
+   |> Selecto.limit(3)},
+  {"sigil DSL",
+   Selecto.configure(config.order_domain, config.repo)
+   |> Selecto.filter(~SELECTO"like(shipping_country, ^country_value)")
+   |> Selecto.select(select([order_number, shipping_country]))
+   |> Selecto.limit(3)},
+  {"tuple form",
+   Selecto.configure(config.order_domain, config.repo)
+   |> Selecto.filter({"shipping_country", country_value})
+   |> Selecto.select(select([order_number, shipping_country]))
+   |> Selecto.limit(3)}
+]
+
+equivalent_filter_queries
+|> Enum.map(fn {label, query} ->
+  {sql, params} = Selecto.to_sql(query)
+  %{style: label, sql: Selecto.format_sql(sql), params: inspect(params)}
+end)
+|> Kino.DataTable.new()
+```
+
+## 18) Interactive Optional Filter Form
+
+Build the optional filter map from Livebook inputs, while keeping defaults for
+automated notebook verification.
+
+```elixir
+status_input = Kino.Input.text("Status", default: "delivered")
+country_input = Kino.Input.text("Country", default: "USA")
+
+safe_read = fn input, default ->
+  try do
+    Kino.Input.read(input) || default
+  rescue
+    _ -> default
+  end
+end
+
+form_filter_map = %{
+  "status" => safe_read.(status_input, "delivered"),
+  "country" => safe_read.(country_input, "USA")
+}
+
+form_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == ^form_filter_map["status"]))
+  |> Selecto.filter(where(shipping_country == ^form_filter_map["country"]))
+  |> Selecto.select(select([order_number, status, shipping_country, total]))
+  |> Selecto.limit(8)
+
+FilteringLab.Helpers.run("Input-built optional filter map", form_query, 8)
+```
+
+## 19) Validate Operator Names
+
+Validate operator names before converting user choices into filter expressions.
+
+```elixir
+allowed_operators = %{
+  "eq" => fn field, value -> {field, value} end,
+  "in" => fn field, value -> {field, {:in, List.wrap(value)}} end
+}
+
+operator_request = %{field: "status", operator: "in", value: ["processing", "shipped"]}
+
+case Map.fetch(allowed_operators, operator_request.operator) do
+  {:ok, builder} ->
+    operator_query =
+      Selecto.configure(config.order_domain, config.repo)
+      |> Selecto.filter(builder.(operator_request.field, operator_request.value))
+      |> Selecto.select(select([order_number, status, total]))
+      |> Selecto.limit(8)
+
+    FilteringLab.Helpers.run("Validated operator filter", operator_query, 8)
+
+  :error ->
+    IO.puts("Rejected unsupported operator: #{operator_request.operator}")
+end
+```
+
+## 20) Filter Syntax Selection Guide
+
+Use this table as a quick guide for generated code and teaching examples.
+
+```elixir
+[
+  %{syntax: "macro DSL", clearest_for: "handwritten Elixir examples", tradeoff: "compile-time expression shape"},
+  %{syntax: "sigil DSL", clearest_for: "compact text filters", tradeoff: "limited helper vocabulary"},
+  %{syntax: "tuple form", clearest_for: "generated filters from validated UI input", tradeoff: "less natural for complex boolean logic"}
+]
+|> Kino.DataTable.new()
+```
+
+## Next Steps
+
+* Add multi-select controls for status and country filter inputs.
+* Add operator validation examples for ranges and null checks.
+* Add a generated-code example that picks syntax based on filter complexity.

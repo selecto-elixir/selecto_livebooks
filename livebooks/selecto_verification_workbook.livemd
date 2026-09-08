@@ -1,0 +1,128 @@
+# Selecto Bounded Verification Workbook
+
+This workbook runs the verification entry points shipped by current Selecto,
+SelectoUpdato, SelectoComponents, and the PostgreSQL write adapter. Each proof
+is exhaustive over its named finite model; none claims to prove arbitrary host
+code or an unbounded state space.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Run the ecosystem safety models
+
+```elixir
+reports = %{
+  query_scope: Selecto.Verification.QuerySafety.verify(),
+  domain_contract: Selecto.Verification.ContractSafety.verify(),
+  write_registry: Selecto.Verification.WriteRegistrySafety.verify(),
+  write_capability_preflight: Selecto.Verification.WriteCapabilitySafety.verify(),
+  governed_query_composition: Selecto.Verification.GovernedQueryComposition.verify(),
+  write_authority_non_escalation: Selecto.Verification.WriteAuthorityNonEscalation.verify(),
+  write_scope: SelectoUpdato.Verification.WriteSafety.verify(),
+  action_capability: SelectoUpdato.Verification.ActionSafety.verify(),
+  portable_command: SelectoUpdato.Verification.PortableCommandSafety.verify(),
+  nested_graph: SelectoUpdato.Verification.NestedGraphSafety.verify(),
+  trust_boundary: SelectoUpdato.Verification.TrustBoundarySafety.verify(),
+  authorization_lifecycle: SelectoUpdato.Verification.AuthorizationLifecycleSafety.verify(),
+  tenant_non_interference: SelectoUpdato.Verification.TenantNonInterferenceSafety.verify(),
+  multi_atomicity: SelectoUpdato.Verification.MultiAtomicitySafety.verify(),
+  postgres_adapter: SelectoDBPostgreSQL.Verification.AdapterSafety.check(),
+  postgres_pool_protocol: SelectoDBPostgreSQL.Verification.PoolProtocol.check(),
+  postgres_stream_protocol: SelectoDBPostgreSQL.Verification.StreamProtocol.check(),
+  postgres_transaction_protocol: SelectoDBPostgreSQL.Verification.TransactionProtocol.check(),
+  action_visibility: SelectoComponents.Verification.ActionVisibility.verify()
+}
+
+Enum.each(reports, fn {name, report} ->
+  true = report.proved?
+
+  IO.puts(
+    "#{name}: #{report.check_count} checks across #{report.state_count} states " <>
+      "(#{report.proof_level})"
+  )
+end)
+
+check_totals = %{
+  selecto:
+    reports
+    |> Map.take([
+      :query_scope,
+      :domain_contract,
+      :write_registry,
+      :write_capability_preflight,
+      :governed_query_composition,
+      :write_authority_non_escalation
+    ])
+    |> Map.values()
+    |> Enum.sum_by(& &1.check_count),
+  updato:
+    reports
+    |> Map.take([
+      :write_scope,
+      :action_capability,
+      :portable_command,
+      :nested_graph,
+      :trust_boundary,
+      :authorization_lifecycle,
+      :tenant_non_interference,
+      :multi_atomicity
+    ])
+    |> Map.values()
+    |> Enum.sum_by(& &1.check_count),
+  postgresql:
+    reports
+    |> Map.take([
+      :postgres_adapter,
+      :postgres_pool_protocol,
+      :postgres_stream_protocol,
+      :postgres_transaction_protocol
+    ])
+    |> Map.values()
+    |> Enum.sum_by(& &1.check_count),
+  components: reports.action_visibility.check_count
+}
+
+%{selecto: 14_050, updato: 115_492, postgresql: 1_080, components: 18} = check_totals
+
+Map.new(reports, fn {name, report} ->
+  {name,
+   Map.take(report, [
+     :model,
+     :proof_level,
+     :state_count,
+     :invariant_count,
+     :check_count,
+     :proved?
+   ])}
+end)
+```
+
+## 2) Produce JSON-ready proof material
+
+Proof reports use portable data and can be persisted by the package Mix tasks:
+`mix selecto.verify`, `mix selecto_updato.verify`, and
+`mix selecto_components.verify`. This cell demonstrates the same JSON boundary
+without writing a file.
+
+```elixir
+proof_json =
+  reports
+  |> Map.new(fn {name, report} -> {to_string(name), report} end)
+  |> Jason.encode!(pretty: true)
+
+proof_json
+```
+
+The PostgreSQL bounded models above prove finite adapter, pool, stream, and
+transaction protocols without opening a database connection. Connection-option
+parsing has focused unit tests, while the adapter's separate bounded relational
+semantics checker is database-backed and runs through
+`mix selecto_db_postgresql.verify_sql`. The adapter conformance preview and real
+transactional rollback probe live in `selecto_updato_feature_tour.livemd`.
+Atomic generated-key and owned-set synchronization probes live in
+`selecto_updato_nested_writes_workbook.livemd`; those notebooks open direct
+Postgrex sessions to complement the finite proofs with real execution.

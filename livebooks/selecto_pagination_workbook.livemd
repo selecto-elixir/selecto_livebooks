@@ -1,0 +1,155 @@
+# Stable Pagination: Offset, Keysets, and Page Boundaries
+
+Business question: how do we page through a priority queue when priorities
+repeat and new orders arrive? This is an application recipe built from
+Selecto's filter/order/limit primitives, not a separate pagination API.
+
+Requires an existing PostgreSQL database reachable through the
+`SELECTO_LIVEBOOKS_DB*` environment variables. It needs no Ecto Repo, migrations,
+or e-commerce seeds. The helper creates six synthetic rows in a **temporary**
+table on a dedicated one-connection session; cleanup is the final cell.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Scope the query before paginating
+
+Read [support/workflow_fixture.exs](support/workflow_fixture.exs) for the full
+domain and rows. Tenant 101 has four visible orders; a hidden order and tenant
+202's order must never enter its pages. The adapter owns the connection handle.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/workflow_fixture.exs", __DIR__))
+connection = SelectoLivebooks.WorkflowFixture.connect!()
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, connection)
+
+base =
+  Selecto.configure(SelectoLivebooks.WorkflowFixture.domain(), runtime, mode: :strict)
+  |> Selecto.with_tenant(tenant_id: 101)
+  |> Selecto.apply_tenant_scope()
+```
+
+## 2) Build a bounded, deterministic page
+
+Sort by `priority DESC, id ASC`: the unique ID breaks ties. Fetch one extra
+row to calculate `has_more?` without counting the entire result set. A cursor
+stores the last **returned** row, not the extra look-ahead row.
+
+Both sort keys are non-null in this fixture. Nullable keys require a deliberate
+NULL-ordering and cursor policy; do not reuse this predicate unchanged for them.
+
+```elixir
+defmodule QueuePages do
+  def query(base, size, cursor \\ nil)
+
+  def query(base, size, cursor) when is_integer(size) and size in 1..100 do
+    query =
+      base
+      |> Selecto.select(["id", "priority", "reference"])
+      |> Selecto.order_by([{"priority", :desc}, {"id", :asc}])
+      |> Selecto.limit(size + 1)
+
+    case cursor do
+      nil -> query
+      %{priority: priority, id: id} = value
+      when is_integer(priority) and is_integer(id) and id > 0 and map_size(value) == 2 ->
+        Selecto.filter(query, {:or, [
+          {"priority", {:lt, priority}},
+          {:and, [{"priority", priority}, {"id", {:gt, id}}]}
+        ]})
+      _ -> raise ArgumentError, "expected a typed priority/id cursor"
+    end
+  end
+
+  def query(_base, _size, _cursor), do: raise(ArgumentError, "page size must be 1..100")
+
+  def page(base, size, cursor \\ nil) do
+    {:ok, {rows, _columns, _aliases}} = Selecto.execute(query(base, size, cursor))
+    items = Enum.take(rows, size)
+    has_more? = length(rows) > size
+
+    next_cursor =
+      if has_more? do
+        [id, priority, _reference] = List.last(items)
+        %{priority: priority, id: id}
+      end
+
+    %{items: items, has_more?: has_more?, next_cursor: next_cursor}
+  end
+end
+
+first = QueuePages.page(base, 2)
+assert first.items == [[1, 3, "A"], [2, 3, "B"]]
+assert first.has_more?
+assert first.next_cursor == %{priority: 3, id: 2}
+first
+```
+
+The SQL predicate uses `<` for descending priority and `>` for ascending ID.
+Changing the sort directions requires changing those comparisons as well.
+
+## 3) Ties, final pages, and empty pages
+
+```elixir
+second = QueuePages.page(base, 2, first.next_cursor)
+assert second.items == [[3, 2, "C"], [6, 1, "D"]]
+refute second.has_more?
+assert second.next_cursor == nil
+assert Enum.map(first.items ++ second.items, &hd/1) == [1, 2, 3, 6]
+
+assert %{items: [], has_more?: false, next_cursor: nil} =
+  QueuePages.page(base, 2, %{priority: 1, id: 6})
+
+assert_raise ArgumentError, fn -> QueuePages.query(base, 0) end
+assert_raise ArgumentError, fn -> QueuePages.query(base, 101) end
+assert_raise ArgumentError, fn -> QueuePages.query(base, 2, %{priority: "3", id: 2}) end
+```
+
+## 4) Observe offset drift after an insertion
+
+For a stable snapshot, `OFFSET` is a reasonable simple page-number interface.
+Here we simulate a new high-priority order arriving between requests. The
+offset moves relative to the changed result set; the keyset boundary does not.
+
+```elixir
+Postgrex.query!(connection, """
+INSERT INTO livebook_workflow_orders (id, tenant_id, reference, priority, status, visible)
+VALUES ($1, $2, $3, $4, $5, $6)
+""", [7, 101, "NEW", 4, "open", true])
+
+offset_query =
+  base
+  |> Selecto.select(["id", "priority", "reference"])
+  |> Selecto.order_by([{"priority", :desc}, {"id", :asc}])
+  |> Selecto.limit(2)
+  |> Selecto.offset(2)
+
+{:ok, {offset_rows, _, _}} = Selecto.execute(offset_query)
+assert offset_rows == [[2, 3, "B"], [3, 2, "C"]]
+assert hd(offset_rows) in first.items
+assert QueuePages.page(base, 2, first.next_cursor).items == second.items
+```
+
+Keysets are not snapshot isolation. Updating a row's sort keys between requests
+can still move it across a cursor. For a repeatable export, choose an appropriate
+transaction/snapshot or stable high-water mark. In an API, sign or authenticate
+cursor tokens and bind them to the tenant, filters, sort order, and version.
+Base64/JSON alone does not provide authenticity; never restore tenant authority
+from a client-supplied cursor. Large-offset and keyset performance require real
+`EXPLAIN`/load measurements and matching indexes, not timing six fixture rows.
+
+## 5) Close the isolated session
+
+```elixir
+:ok = GenServer.stop(connection)
+```
+
+To rerun, start again at the fixture cell after closing the old session. No
+permanent tables or records were created. Continue with
+[tenant-scoped reads](selecto_tenant_reads_workbook.livemd) for the security
+boundary that every page should inherit.

@@ -1,0 +1,372 @@
+# SelectoUpdato: Atomic Nested Writes
+
+## Overview
+
+SelectoUpdato 0.4 restores nested writes with a different ownership boundary:
+the domain describes an owned relationship, Updato compiles a portable atomic
+`Selecto.Write.Graph`, and the configured database adapter owns generated-key
+propagation, SQL strategy, transaction behavior, and rollback.
+
+This workbook runs a nested insert and owned-child synchronization against
+isolated PostgreSQL temporary tables. It uses Postgrex directly—there is no
+`Ecto.Repo`, schema, changeset, or Updato-owned SQL path.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_updato!()
+```
+
+## 1) The new finite-model coverage
+
+The portable-command model crosses 48 states with nine invariants. The
+nested-graph model crosses 24 states with six invariants. Together with the
+write-scope and action-capability models, current Updato executes 688 bounded
+checks.
+
+```elixir
+portable_report = SelectoUpdato.Verification.PortableCommandSafety.verify()
+nested_report = SelectoUpdato.Verification.NestedGraphSafety.verify()
+
+%{state_count: 48, invariant_count: 9, check_count: 432, proved?: true} =
+  Map.take(portable_report, [:state_count, :invariant_count, :check_count, :proved?])
+
+%{state_count: 24, invariant_count: 6, check_count: 144, proved?: true} =
+  Map.take(nested_report, [:state_count, :invariant_count, :check_count, :proved?])
+```
+
+## 2) One Postgrex session and two isolated tables
+
+Temporary tables belong to one PostgreSQL session, so the direct connection
+uses a one-process pool.
+
+```elixir
+connection_config =
+  SelectoLivebooksNotebookBootstrap.repo_config()
+  |> Keyword.put(:pool_size, 1)
+
+{:ok, connection} = Postgrex.start_link(connection_config)
+
+run_suffix = System.unique_integer([:positive, :monotonic])
+orders_table = "updato_nested_orders_#{run_suffix}"
+items_table = "updato_nested_items_#{run_suffix}"
+
+Postgrex.query!(connection, """
+CREATE TEMP TABLE #{orders_table} (
+  id bigserial PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  reference text NOT NULL
+)
+""", [])
+
+Postgrex.query!(connection, """
+CREATE TEMP TABLE #{items_table} (
+  id bigserial PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  order_id bigint NOT NULL REFERENCES #{orders_table}(id),
+  sku text NOT NULL,
+  quantity integer NOT NULL
+)
+""", [])
+
+tenant_id = 91_001
+```
+
+## 3) Complete parent and child contracts
+
+Field policy is colocated with each source column, and relationship policy is
+colocated with the source association it governs. Selecto normalizes those
+authoring conveniences into canonical `writes.fields` and
+`writes.relationships` before Updato compiles the graph. Each level still has
+its own required insert fields, tenant scope, and cardinality contract. The
+caller may submit `items`, but may not submit `order_id`: the graph binds that
+ownership key from the generated parent `id`.
+
+```elixir
+item_domain = %{
+  name: "Nested order items",
+  source: %{
+    source_table: items_table,
+    primary_key: :id,
+    fields: [:id, :tenant_id, :order_id, :sku, :quantity],
+    columns: %{
+      id: %{type: :integer, write: %{server_managed: true}},
+      tenant_id: %{type: :integer, write: %{insertable: true, immutable: true}},
+      order_id: %{type: :integer},
+      sku: %{
+        type: :string,
+        write: %{insertable: true, updatable: true, required_on: [:insert]}
+      },
+      quantity: %{
+        type: :integer,
+        write: %{insertable: true, updatable: true, required_on: [:insert]}
+      }
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  joins: %{},
+  writes: %{
+    operations: %{
+      insert: %{enabled: true, expected_cardinality: {:exactly, 1}},
+      update: %{
+        enabled: true,
+        require_filter: true,
+        expected_cardinality: {:exactly, 1}
+      }
+    },
+    scope: %{tenant: %{required: true, field: :tenant_id}},
+    relationships: %{}
+  }
+}
+
+order_domain = %{
+  name: "Nested orders",
+  source: %{
+    source_table: orders_table,
+    primary_key: :id,
+    fields: [:id, :tenant_id, :reference],
+    columns: %{
+      id: %{type: :integer, write: %{server_managed: true}},
+      tenant_id: %{type: :integer, write: %{insertable: true, immutable: true}},
+      reference: %{
+        type: :string,
+        write: %{insertable: true, updatable: true, required_on: [:insert]}
+      }
+    },
+    associations: %{
+      items: %{
+        queryable: :items,
+        field: :items,
+        cardinality: :many,
+        owner_key: :id,
+        related_key: :order_id,
+        write: %{
+          writable: true,
+          ownership: :owned,
+          allowed_ops: [:insert, :update, :delete],
+          domain: item_domain,
+          identity_fields: [:id],
+          strategy: :sync,
+          delete_missing: true,
+          min_items: 1,
+          max_items: 10
+        }
+      }
+    }
+  },
+  schemas: %{},
+  joins: %{},
+  writes: %{
+    operations: %{
+      insert: %{
+        enabled: true,
+        expected_cardinality: {:exactly, 1},
+        returning: :all
+      },
+      update: %{
+        enabled: true,
+        require_filter: true,
+        expected_cardinality: {:exactly, 1},
+        returning: :all
+      }
+    },
+    scope: %{tenant: %{required: true, field: :tenant_id}}
+  }
+}
+
+selecto = %Selecto{
+  domain: order_domain,
+  adapter: SelectoDBPostgreSQL.Adapter,
+  connection: connection
+}
+```
+
+## 4) Fail closed before adapter dispatch
+
+Required root fields and generated ownership fields are checked while
+compiling portable intent. Neither failure can reach adapter preview or SQL.
+
+```elixir
+missing_reference =
+  order_domain
+  |> SelectoUpdato.new(tenant: %{tenant_id: tenant_id})
+  |> SelectoUpdato.insert(%{items: [%{sku: "A", quantity: 2}]})
+
+{:error, %SelectoUpdato.Error{type: :validation}} =
+  SelectoUpdato.PortableCommand.compile(missing_reference)
+
+ownership_override =
+  order_domain
+  |> SelectoUpdato.new(tenant: %{tenant_id: tenant_id})
+  |> SelectoUpdato.insert(%{
+    reference: "SO-FORGED",
+    items: [%{order_id: 999, sku: "A", quantity: 2}]
+  })
+
+{:error,
+ %SelectoUpdato.Error{
+   type: :invalid_graph,
+   details: %{field: :order_id}
+ }} = SelectoUpdato.PortableCommand.compile(ownership_override)
+```
+
+## 5) Compile and preview a generated-key graph
+
+The root row comes first. The child node binds `order_id` from the root's
+returned `id`; tenant scope is compiled independently into every row. Preview
+is adapter-owned and reports an atomic graph without mutating the database.
+
+```elixir
+insert_operation =
+  order_domain
+  |> SelectoUpdato.new(tenant: %{tenant_id: tenant_id})
+  |> SelectoUpdato.insert(%{
+    reference: "SO-100",
+    items: [
+      %{sku: "A", quantity: 2},
+      %{sku: "B", quantity: 1}
+    ]
+  })
+  |> SelectoUpdato.returning([:id, :reference])
+
+{:ok, %Selecto.Write.Graph{} = insert_graph, %{tenant_id: ^tenant_id}} =
+  SelectoUpdato.PortableCommand.compile(insert_operation)
+
+:ok = Selecto.Write.Graph.validate(insert_graph)
+["root", "items"] = Enum.map(insert_graph.nodes, & &1.id)
+
+items_node = Enum.find(insert_graph.nodes, &(&1.id == "items"))
+
+true =
+  Enum.all?(items_node.rows, fn row ->
+    match?(
+      [%Selecto.Write.Graph.Binding{
+        field: :order_id,
+        from_node: "root",
+        from_field: :id
+      }],
+      row.bindings
+    )
+  end)
+
+{:ok, insert_preview} = SelectoUpdato.preview(insert_operation, selecto)
+true = insert_preview.metadata.atomic?
+true = insert_preview.metadata.graph?
+insert_preview
+```
+
+## 6) Execute the atomic nested insert
+
+The PostgreSQL adapter owns the transaction and generated-key propagation. The
+public result contains the root projection; the direct query below verifies
+that both children received the generated parent id and trusted tenant.
+
+```elixir
+{:ok, inserted} = SelectoUpdato.execute(insert_operation, selecto)
+[%{"id" => order_id, "reference" => "SO-100"}] = inserted.rows
+
+%Postgrex.Result{
+  rows: [
+    [first_item_id, ^tenant_id, ^order_id, "A", 2],
+    [second_item_id, ^tenant_id, ^order_id, "B", 1]
+  ]
+} =
+  Postgrex.query!(
+    connection,
+    "SELECT id, tenant_id, order_id, sku, quantity FROM #{items_table} " <>
+      "WHERE order_id = $1 ORDER BY sku",
+    [order_id]
+  )
+```
+
+## 7) Synchronize the complete owned child set
+
+An item with its declared identity compiles as an update; one without identity
+compiles as an insert. With `delete_missing: true`, omitting item B removes it.
+PostgreSQL 17+ may use a single safe `MERGE`; older servers use the ordered
+fallback. The adapter chooses, and the graph remains atomic either way.
+
+```elixir
+sync_operation =
+  order_domain
+  |> SelectoUpdato.new(tenant: %{tenant_id: tenant_id})
+  |> SelectoUpdato.filter({:id, order_id})
+  |> SelectoUpdato.update(%{
+    reference: "SO-100-R",
+    items: [
+      %{id: first_item_id, sku: "A", quantity: 3},
+      %{sku: "C", quantity: 1}
+    ]
+  })
+  |> SelectoUpdato.returning([:id, :reference])
+
+{:ok, %Selecto.Write.Graph{} = sync_graph, _context} =
+  SelectoUpdato.PortableCommand.compile(sync_operation)
+
+sync_node = Enum.find(sync_graph.nodes, &(&1.id == "items"))
+:sync = sync_node.strategy
+[:id] = sync_node.identity_fields
+true = sync_node.delete_missing?
+
+{:ok, synced} = SelectoUpdato.execute(sync_operation, selecto)
+true = synced.metadata.node_strategies["items"] in [:merge, :ordered_fallback]
+
+%Postgrex.Result{
+  rows: [
+    [^first_item_id, "A", 3],
+    [new_item_id, "C", 1]
+  ]
+} =
+  Postgrex.query!(
+    connection,
+    "SELECT id, sku, quantity FROM #{items_table} WHERE order_id = $1 ORDER BY sku",
+    [order_id]
+  )
+
+true = new_item_id not in [first_item_id, second_item_id]
+synced
+```
+
+## 8) Relationship typos fail before dispatch
+
+The strict relationship validator checks `parent_key`, `child_key`, and
+`identity_fields` against their respective domains. A misspelled child key is
+an invalid contract, not a database error.
+
+```elixir
+invalid_domain =
+  put_in(order_domain, [:source, :associations, :items, :write, :child_key], :missing_order_id)
+
+invalid_operation =
+  invalid_domain
+  |> SelectoUpdato.new(tenant: %{tenant_id: tenant_id})
+  |> SelectoUpdato.insert(%{
+    reference: "SO-BAD-CONTRACT",
+    items: [%{sku: "A", quantity: 1}]
+  })
+
+{:error,
+ %SelectoUpdato.Error{
+   type: :invalid_operation,
+   details: %{errors: relationship_errors}
+ }} = SelectoUpdato.PortableCommand.compile(invalid_operation)
+
+true =
+  Enum.any?(relationship_errors, fn {path, message} ->
+    path == [:writes, :relationships, :items, :child_key] and
+      message =~ "child domain"
+  end)
+```
+
+## 9) Cleanup and limits
+
+The current graph contract supports atomic nested insert and update roots with
+owned relationships. It deliberately excludes shared-reference mutation,
+caller-authored SQL, cross-database graphs, arbitrary callbacks, and
+best-effort partial persistence. Nested root updates and existing child rows
+currently need at least one writable scalar change.
+
+```elixir
+GenServer.stop(connection)
+:ok
+```

@@ -1,0 +1,165 @@
+# Domain Actions: Inputs, Variants, Capabilities, and Presentation
+
+An approval button needs a named operation, typed inputs, policy decisions,
+and a defined result. This workbook builds those pieces from a domain and
+checks them without a database. Continue with the live action workbook to
+execute a plan and test row guards.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Read the action beside its write policy
+
+The [shared fixture](support/action_fixture.exs) is a complete authored domain.
+It declares writable fields beside their column types, an `open → approved`
+transition, a `ready = true` precondition, and two capabilities. Read that
+fixture before adapting this example to an application.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+domain = SelectoLivebooks.ActionFixture.domain()
+assert {:ok, normalized, _diagnostics} = Selecto.Domain.validate(domain)
+assert normalized.writes.fields.state.updatable
+domain.actions.approve
+```
+
+The action's `confirmation` and `audit` describe what a host should present and
+record. Planning does not display a dialog or persist an audit event.
+
+## 2) Plan from caller intent and trusted host context
+
+The user selects the action and target. The host resolves the authenticated
+actor. Execution templates may read `{:input, field}` or `{:context, field}`;
+only the planner's `trusted_context` option supplies the latter.
+
+```elixir
+intent = %{
+  action: :approve, target: %{id: "1"},
+  context: %{actor_id: 999}, preconditions: []
+}
+assert {:ok, plan} = SelectoUpdato.plan_domain_action(domain, intent,
+  trusted_context: %{actor_id: 17})
+assert plan.changes == %{state: "approved", reviewed_by_id: 17}
+assert {"id", 1} in plan.filters
+assert {"ready", true} in plan.filters
+assert {"state", "open"} in plan.filters
+assert plan.expected_cardinality == {:exactly, 1}
+assert %SelectoUpdato.PlannedOperation{} = plan.operation_builder
+
+assert {:error, %{code: :missing_action_context_reference}} =
+  SelectoUpdato.plan_domain_action(domain, intent)
+
+Map.take(plan, [:action, :inputs, :filters, :changes, :preconditions, :confirmation])
+```
+
+The planned builder is opaque. It cannot be passed straight to raw write APIs.
+The host execution adapter will receive a builder after authorization.
+
+```elixir
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only)
+target = Selecto.configure(domain, runtime)
+assert {:error, %{details: %{code: :opaque_planned_operation}}} =
+  SelectoUpdato.preview(plan.operation_builder, target)
+```
+
+## 3) Choose variants after input coercion
+
+The `record_review` action has an accepted path and a needs-work path. Only the
+second path requires a reason. The planner checks the selected variant's inputs.
+
+```elixir
+assert {:ok, accepted} = SelectoUpdato.plan_domain_action(domain, %{
+  action: :record_review, target: 1, inputs: %{accepted: "true"}
+})
+assert accepted.inputs["accepted"] == true
+assert accepted.changes == %{note: "Review accepted"}
+
+assert {:error, _} = SelectoUpdato.plan_domain_action(domain, %{
+  action: :record_review, target: 1, inputs: %{accepted: "false"}
+})
+assert {:ok, needs_work} = SelectoUpdato.plan_domain_action(domain, %{
+  action: :record_review, target: 1,
+  inputs: %{accepted: "false", reason: "Missing packing details"}
+})
+assert needs_work.changes == %{note: "Missing packing details"}
+assert {:error, _} = SelectoUpdato.plan_domain_action(domain, %{
+  action: :record_review, target: 1, inputs: %{accepted: "perhaps"}
+})
+```
+
+## 4) Ask the host policy for each phase
+
+This small policy allows approvers to preview, and requires a separate apply
+permission for execution. In an application, both permission values come from
+the authenticated host. A preview decision does not authorize a later apply.
+
+```elixir
+policy = fn request, context, _opts ->
+  cond do
+    request.capability != "approvals.approve" -> :hidden
+    context.actor.role != :approver -> :hidden
+    request.phase == :execute and not context.actor.can_apply ->
+      %{status: :disabled, reason: "Apply permission is required"}
+    true -> :enabled
+  end
+end
+context = %{actor: %{id: 17, role: :approver, can_apply: false}, tenant: %{tenant_id: 101}}
+
+assert {:error, {:validation_error, _, %{code: :missing_capability_resolver}}} =
+  SelectoUpdato.authorize_domain_action(plan, :preview, context)
+assert {:ok, preview_decision} =
+  SelectoUpdato.authorize_domain_action(plan, :preview, context, capability_resolver: policy)
+assert preview_decision.status == :enabled
+assert {:error, {:validation_error, _, %{status: :disabled}}} =
+  SelectoUpdato.authorize_domain_action(plan, :execute, context, capability_resolver: policy)
+```
+
+## 5) Drive action presentation from the contract
+
+The generated document is suitable for Components' action helpers. These calls
+produce presentation data; they do not render LiveView or authorize writes.
+
+```elixir
+assert {:ok, document, _diagnostics} = SelectoUpdato.DomainContract.json_document(domain)
+items = SelectoComponents.Actions.available(document, decisions: %{
+  "approvals.approve" => %{status: :disabled, reason: "Apply permission is required"},
+  "approvals.review" => %{status: :hidden}
+})
+assert [item] = items
+assert item.id == "approve"
+assert item.disabled?
+assert item.requires_confirmation?
+assert item.reason == "Apply permission is required"
+assert SelectoComponents.Actions.selection_fields(domain) == ["eligible"]
+
+action = domain.actions.approve
+assert SelectoComponents.Actions.row_eligible?(action, %{eligible: true})
+refute SelectoComponents.Actions.row_eligible?(action, %{eligible: nil})
+refute SelectoComponents.Actions.row_eligible?(action, %{})
+items
+```
+
+## 6) Make bulk selection explicit
+
+The domain enables bulk updates and this action opts into bulk selection.
+Concrete selected IDs produce an exact expected count. Duplicate or empty
+selections are rejected before execution.
+
+```elixir
+assert {:ok, bulk} = SelectoUpdato.plan_domain_action(domain,
+  %{action: :approve, target: %{ids: ["1", "4"]}}, trusted_context: %{actor_id: 17})
+assert bulk.scope == "bulk"
+assert bulk.expected_cardinality == {:exactly, 2}
+for ids <- [[], [1, 1]] do
+  assert {:error, %{code: :invalid_action_target}} = SelectoUpdato.plan_domain_action(domain,
+    %{action: :approve, target: %{ids: ids}}, trusted_context: %{actor_id: 17})
+end
+```
+
+Continue with [guarded action execution](selecto_action_execution_workbook.livemd)
+to test readiness changes, tenant isolation, and rollback on partial bulk matches.

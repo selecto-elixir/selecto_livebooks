@@ -1,0 +1,793 @@
+# Selecto Focus Notebook: Selection, Shapes, Subselects, and Retargets
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This notebook focuses on four related query-building patterns:
+
+1. Selection (`Selecto.select/2`)
+2. Selection shapes (`Selecto.select_shape/2` + `Selecto.execute_shape/2`)
+3. Subselects (`Selecto.subselect/3`)
+4. Retargets (`Selecto.retarget/3`)
+
+### Domain Join Map
+
+```mermaid
+graph LR
+  orders[orders]
+  customers[customers]
+  order_items[order_items]
+  products[products]
+
+  orders -->|customer_id -> id| customers
+  orders -->|id -> order_id| order_items
+  order_items -->|product_id -> id| products
+```
+
+### Selection Mode Map
+
+```mermaid
+flowchart LR
+  base["Configure base query"]
+  flat["Select flat row output"]
+  shaped["Select shape and execute shape"]
+  sub["Subselect aggregated related data"]
+  retarget["Retarget to new root table"]
+
+  base --> flat
+  base --> shaped
+  base --> sub
+  base --> retarget
+```
+
+Before running, initialize the sample database:
+
+Run this command in a terminal (outside Livebook) once per local environment:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Shared Repo and Load Domain Config
+
+This cell starts the shared sample-app repo and loads the maintained order
+domain from `selecto_livebooks`.
+
+```elixir
+config = SelectoLivebooks.NotebookSupport.config([:order_domain, :customer_domain])
+order_count = SelectoLivebooks.NotebookSupport.table_counts(["orders"])["orders"]
+
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+## Setup 3) Define Query Helpers
+
+This helper cell adds utility functions that print generated SQL/params and execute queries with a consistent preview format.
+
+```elixir
+defmodule SelectionFocus.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+
+  def run(label, query, opts \\ []) do
+    Selecto.Livebook.run(label, query, Keyword.put_new(opts, :preview_count, 5))
+  end
+
+  def run_shape(label, query, opts \\ []) do
+    Selecto.Livebook.run_shape(label, query, Keyword.put_new(opts, :preview_count, 5))
+  end
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+This notebook keeps shape/subselect containers in their existing explicit form,
+but now uses the shipped expression DSL where it improves ordinary filter,
+selection, and retarget readability.
+
+```elixir
+import Selecto.ExprMacros
+import Selecto.Sigil
+
+alias Selecto.Expr, as: X
+
+:ok
+```
+
+## 1) Selection Basics
+
+This cell demonstrates mixed selection output:
+plain fields, joined fields, a structured row (`ship_to`), and a computed array field.
+
+```elixir
+selection_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "total",
+    "customer.name",
+    {:row, ["shipping_city", "shipping_country"], "ship_to"},
+    {:field, {:array, [{:field, "status"}, {:field, "shipping_country"}]}, "status_country"}
+  ])
+  |> Selecto.filter({"status", {:in, ["processing", "shipped", "delivered"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(5)
+
+{:ok, {rows, _columns, _aliases}} = SelectionFocus.Helpers.run("Selection query", selection_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, ship_to, status_country] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} " <>
+      "ship_to=#{inspect(ship_to)} status_country=#{inspect(status_country)}"
+  )
+end)
+
+:ok
+```
+
+## 1.1) Composable Selection with Multiple `select/2` Calls
+
+`select/2` is composable: you can add fields in stages as requirements evolve.
+This cell builds one query in multiple steps, then executes it.
+
+```elixir
+base_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter({"status", {:in, ["processing", "shipped", "delivered"]}})
+  |> Selecto.order_by({"inserted_at", :desc})
+  |> Selecto.limit(5)
+
+# Stage 1: core identifiers
+query_stage_1 =
+  base_query
+  |> Selecto.select(["order_number", "status"])
+
+# Stage 2: business totals
+query_stage_2 =
+  query_stage_1
+  |> Selecto.select(["total"])
+
+# Stage 3: related data + structured projection
+composable_select_query =
+  query_stage_2
+  |> Selecto.select([
+    "customer.name",
+    {:row, ["shipping_city", "shipping_country"], "ship_to"},
+    # Re-selecting "status" demonstrates deduping in set.selected
+    "status"
+  ])
+
+IO.inspect(composable_select_query.set.selected, label: "Final selected fields (deduped)")
+
+{:ok, {rows, _columns, _aliases}} =
+  SelectionFocus.Helpers.run("Composable select query", composable_select_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, ship_to] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} " <>
+      "ship_to=#{inspect(ship_to)}"
+  )
+end)
+
+:ok
+```
+
+## 2) Selection Shapes (`select_shape/2`)
+
+Selection shapes let you describe a nested list/tuple output and then materialize
+rows with that same structure.
+
+```mermaid
+flowchart TD
+  input_shape["Shape input list and tuple"]
+  compiled_plan["Compile plan and subselects"]
+  execute_shape["Execute shape query"]
+  shaped_rows["Nested shaped rows output"]
+
+  input_shape --> compiled_plan --> execute_shape --> shaped_rows
+```
+
+This cell builds a shape query, prints the compiled shape plan, and executes it with `execute_shape/2`.
+
+```elixir
+import Selecto.ExprMacros
+
+shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "total"},
+    "customer.name",
+    ["order_items.quantity", "order_items.line_total"]
+  ])
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.explain("Selection shape query", shape_query)
+IO.inspect(shape_query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+{:ok, shaped_rows} = Selecto.execute_shape(shape_query)
+IO.inspect(shaped_rows, label: "execute_shape/2 output", pretty: true, limit: :infinity)
+
+Enum.each(shaped_rows, fn [order_number, {status, total}, customer_name, line_items] ->
+  IO.puts("\norder=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name}")
+
+  Enum.each(line_items, fn [quantity, line_total] ->
+    IO.puts("  item quantity=#{quantity} line_total=#{inspect(line_total)}")
+  end)
+end)
+
+:ok
+```
+
+## 2.1) Shape Variant: Tuple Subselect Nodes
+
+Tuple containers over a single joined schema materialize as lists of tuples.
+This is useful when you want stronger positional semantics than list-of-lists output.
+
+```elixir
+import Selecto.ExprMacros
+
+tuple_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select_shape([
+    "order_number",
+    {"order_items.quantity", "order_items.line_total"}
+  ])
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.explain("Tuple shape query", tuple_shape_query)
+IO.inspect(tuple_shape_query.set.selection_shape, label: "Tuple shape plan", pretty: true, limit: :infinity)
+
+{:ok, tuple_shaped_rows} = Selecto.execute_shape(tuple_shape_query)
+IO.inspect(tuple_shaped_rows, label: "Tuple-shape output", pretty: true, limit: :infinity)
+
+Enum.each(tuple_shaped_rows, fn [order_number, item_tuples] ->
+  IO.puts("\norder=#{order_number} tuple_items=#{length(item_tuples)}")
+
+  Enum.each(item_tuples, fn {quantity, line_total} ->
+    IO.puts("  tuple item quantity=#{quantity} line_total=#{inspect(line_total)}")
+  end)
+end)
+
+:ok
+```
+
+## 3) Explicit Subselects (`subselect/3`)
+
+Use `subselect/3` when you want explicit control over embedded related data.
+
+This cell adds an explicit JSON aggregate subselect for `order_items` and prints per-order item counts.
+
+```elixir
+import Selecto.ExprMacros
+
+subselect_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total, customer.name]))
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.subselect([
+    %{
+      target_schema: :order_items,
+      fields: ["quantity", "line_total"],
+      format: :json_agg,
+      alias: "line_items"
+    }
+  ])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(5)
+
+{:ok, {rows, _columns, _aliases}} = SelectionFocus.Helpers.run("Subselect query", subselect_query)
+
+Enum.each(rows, fn [order_number, status, total, customer_name, line_items] ->
+  count = line_items |> List.wrap() |> length()
+
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} customer=#{customer_name} line_items=#{count}"
+  )
+end)
+
+:ok
+```
+
+## 3.1) Nested Explicit Subselects
+
+Nested subselect specs let a parent JSON aggregate carry child arrays without multiplying the root rows. This cell attaches order items to each order and nests the product payload under each line item.
+
+```elixir
+import Selecto.ExprMacros
+
+nested_subselect_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.subselect([
+    %{
+      target_schema: :order_items,
+      fields: ["quantity", "line_total"],
+      format: :json_agg,
+      alias: "line_items",
+      join_path: [:order_items],
+      nested: [
+        %{
+          key: "product",
+          target_schema: :products,
+          fields: ["name", "sku"],
+          format: :json_agg,
+          join_path: [:order_items, :product]
+        }
+      ]
+    }
+  ])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(5)
+
+SelectionFocus.Helpers.explain("Nested subselect query", nested_subselect_query)
+
+{:ok, {rows, _columns, _aliases}} =
+  SelectionFocus.Helpers.run("Nested subselect query", nested_subselect_query)
+
+Enum.each(rows, fn [order_number, status, total, line_items] ->
+  IO.puts("\norder=#{order_number} status=#{status} total=#{inspect(total)}")
+
+  line_items
+  |> List.wrap()
+  |> Enum.take(2)
+  |> Enum.each(fn item ->
+    product =
+      item["product"]
+      |> List.wrap()
+      |> List.first(%{})
+
+    IO.puts(
+      "  item quantity=#{item["quantity"]} line_total=#{inspect(item["line_total"])} " <>
+        "product=#{product["name"] || "(missing)"} sku=#{product["sku"] || "(missing)"}"
+    )
+  end)
+end)
+
+:ok
+```
+
+## 3.2) Subselect Format Matrix
+
+This cell compares subselect aggregation formats that fit the numeric
+`order_items` sample fields: `:json_agg`, `:array_agg`, and `:count`.
+
+```elixir
+import Selecto.ExprMacros
+
+subselect_formats = [
+  {"json_agg", %{fields: ["quantity", "line_total"], target_schema: :order_items, format: :json_agg, alias: "line_items_json"}},
+  {"array_agg", %{fields: ["quantity"], target_schema: :order_items, format: :array_agg, alias: "quantities_array"}},
+  {"count", %{fields: ["id"], target_schema: :order_items, format: :count, alias: "line_item_count"}}
+]
+
+Enum.each(subselect_formats, fn {label, spec} ->
+  query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([order_number, status]))
+    |> Selecto.filter(where(status == "processing" or status == "shipped"))
+    |> Selecto.subselect([spec])
+    |> Selecto.order_by(order_by([desc(inserted_at)]))
+    |> Selecto.limit(2)
+
+  SelectionFocus.Helpers.explain("Subselect format: #{label}", query)
+
+  case Selecto.execute(query) do
+    {:ok, {rows, _columns, _aliases}} ->
+      IO.inspect(rows, label: "Preview rows (#{label})", pretty: true, limit: :infinity)
+
+    {:error, error} ->
+      IO.puts("Error for #{label}: #{inspect(error)}")
+  end
+end)
+
+:ok
+```
+
+## 3.3) Subselect Syntax Variants
+
+`subselect/3` accepts both compact string syntax and explicit map syntax.
+This cell runs one query for each style so you can compare readability and output.
+
+```elixir
+import Selecto.ExprMacros
+
+string_syntax_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name]))
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.subselect(["order_items.quantity"])
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.run("Subselect string syntax", string_syntax_query)
+
+map_syntax_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name]))
+  |> Selecto.filter(where(status == "processing" or status == "shipped"))
+  |> Selecto.subselect([
+    %{
+      target_schema: :order_items,
+      fields: ["id"],
+      format: :count,
+      alias: "line_item_count"
+    },
+    %{
+      target_schema: :order_items,
+      fields: ["line_total"],
+      format: :array_agg,
+      alias: "line_totals"
+    }
+  ])
+  |> Selecto.order_by(order_by([desc(inserted_at)]))
+  |> Selecto.limit(3)
+
+SelectionFocus.Helpers.run("Subselect map syntax", map_syntax_query)
+```
+
+## 4) Retargeting (`retarget/3`)
+
+Retargeting changes the query root. Here we retarget delivered orders to `order_items`
+to analyze line-level data.
+
+```mermaid
+flowchart LR
+  pre["Orders root with pre retarget filters"]
+  retarget_call["Retarget to order items"]
+  post["Order items root with post retarget filters"]
+  out["Line level rows"]
+
+  pre --> retarget_call --> post --> out
+```
+
+This first retarget cell builds a line-level query rooted at `order_items` and previews raw rows.
+
+```elixir
+import Selecto.ExprMacros
+
+retarget_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity"), as(order_items.line_total, "line_total")]))
+
+SelectionFocus.Helpers.run("Retarget query (line-level rows)", retarget_query)
+```
+
+This follow-up cell aggregates retargeted rows into product-level metrics (delivered quantity and revenue), then prints the top results.
+
+```elixir
+{:ok, {rows, _columns, _aliases}} = Selecto.execute(retarget_query)
+
+rows
+|> Enum.group_by(fn [product_id, _quantity, _line_total] -> product_id end)
+|> Enum.map(fn {product_id, product_rows} ->
+  quantity_sum = Enum.reduce(product_rows, 0, fn [_product_id, quantity, _line_total], acc -> acc + quantity end)
+
+  revenue_sum =
+    Enum.reduce(product_rows, Decimal.new("0"), fn [_product_id, _quantity, line_total], acc ->
+      Decimal.add(acc, line_total || Decimal.new("0"))
+    end)
+
+  {product_id, quantity_sum, revenue_sum}
+end)
+|> Enum.sort(fn {_product_id_a, _quantity_sum_a, revenue_a}, {_product_id_b, _quantity_sum_b, revenue_b} ->
+  Decimal.compare(revenue_a, revenue_b) in [:gt, :eq]
+end)
+|> Enum.take(10)
+|> Enum.each(fn {product_id, quantity_sum, revenue_sum} ->
+  IO.puts("product_id=#{product_id} delivered_quantity=#{quantity_sum} delivered_revenue=#{inspect(revenue_sum)}")
+end)
+
+:ok
+```
+
+## 4.1) Retarget Strategy Comparison (`:in`, `:exists`)
+
+This cell compares generated SQL and row counts across the retarget subquery
+strategies that preserve the pre-retarget filter in this query shape.
+
+```elixir
+import Selecto.ExprMacros
+
+Enum.each([:in, :exists], fn strategy ->
+  query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.filter(where(status == "delivered"))
+    |> Selecto.retarget(:order_items, subquery_strategy: strategy)
+    |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity"), as(order_items.line_total, "line_total")]))
+    |> Selecto.limit(5)
+
+  SelectionFocus.Helpers.explain("Retarget strategy #{strategy}", query)
+
+  case Selecto.execute(query) do
+    {:ok, {strategy_rows, _columns, _aliases}} ->
+      IO.puts("Rows returned for #{strategy}: #{length(strategy_rows)}")
+      IO.inspect(Enum.take(strategy_rows, 3), label: "Preview (#{strategy})")
+
+    {:error, error} ->
+      IO.puts("Error for #{strategy}: #{inspect(error)}")
+  end
+end)
+
+:ok
+```
+
+## 4.2) Pre- vs Post-Retarget Filters (`preserve_filters`)
+
+Filters added before `retarget/3` are preserved as pre-retarget constraints.
+Filters added after `retarget/3` are post-retarget constraints on the new root.
+For the current Selecto build, post-retarget filters should target the retarget root field name directly (for example `"quantity"`), so this example uses `Selecto.post_retarget_filter/2`.
+This cell compares SQL and results for:
+
+1. pre-retarget only
+2. pre + post retarget
+3. post-retarget only with `preserve_filters: false`
+
+```elixir
+import Selecto.ExprMacros
+
+retarget_pre_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity")]))
+  |> Selecto.limit(5)
+
+retarget_pre_and_post_filter_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.post_retarget_filter({"quantity", 2})
+  |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity")]))
+  |> Selecto.limit(5)
+
+retarget_post_only_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists, preserve_filters: false)
+  |> Selecto.post_retarget_filter({"quantity", 2})
+  |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity")]))
+  |> Selecto.limit(5)
+
+for {label, query} <- [
+      {"pre-retarget filter only", retarget_pre_filter_query},
+      {"pre + post retarget filters", retarget_pre_and_post_filter_query},
+      {"post-retarget only (preserve_filters: false)", retarget_post_only_query}
+    ] do
+  {sql, _params} = Selecto.to_sql(query)
+  sql_downcase = String.downcase(sql)
+
+  IO.puts("\n#{label}")
+  IO.puts("contains status filter: #{String.contains?(sql_downcase, "status")}")
+  IO.puts("contains quantity filter: #{String.contains?(sql_downcase, "quantity")}")
+
+  SelectionFocus.Helpers.run(label, query)
+end
+
+:ok
+```
+
+## 10) Compare Pre- and Post-Retarget Filters
+
+This cell turns the earlier retarget variants into a compact SQL comparison
+table.
+
+```elixir
+retarget_filter_comparison =
+  [
+    {"pre only", retarget_pre_filter_query},
+    {"pre + post", retarget_pre_and_post_filter_query},
+    {"post only", retarget_post_only_query}
+  ]
+  |> Enum.map(fn {label, query} ->
+    {sql, params} = Selecto.to_sql(query)
+
+    %{
+      label: label,
+      contains_status: String.contains?(String.downcase(sql), "status"),
+      contains_quantity: String.contains?(String.downcase(sql), "quantity"),
+      params: inspect(params),
+      sql: Selecto.format_sql(sql)
+    }
+  end)
+
+Kino.DataTable.new(retarget_filter_comparison)
+```
+
+## 11) Replace Explicit Subselects with Nested Shapes
+
+For consumers that only need structured row output, `select_shape/2` can replace
+some explicit subselect payloads.
+
+```elixir
+nested_shape_replacement_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total, customer.name]))
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "total"},
+    "customer.name"
+  ])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+SelectionFocus.Helpers.run_shape("Nested shape replacement", nested_shape_replacement_query)
+```
+
+## 12) Execute Versus Execute Shape
+
+Run the same logical query through both execution paths to see the raw rows and
+the shaped rows side by side.
+
+```elixir
+shape_compare_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.select_shape(["order_number", {"status", "total"}])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(5)
+
+{:ok, {raw_rows, raw_columns, _aliases}} = Selecto.execute(shape_compare_query)
+{:ok, shaped_rows} = Selecto.execute_shape(shape_compare_query)
+
+[
+  %{
+    path: "execute/2",
+    columns: inspect(raw_columns),
+    sample: inspect(raw_rows, limit: 5)
+  },
+  %{
+    path: "execute_shape/2",
+    columns: "shape",
+    sample: inspect(shaped_rows, limit: 5)
+  }
+]
+|> Kino.DataTable.new()
+```
+
+## 13) Shape Output vs API DTO Maps
+
+Compare `select_shape/2` output with an equivalent map-based API payload.
+
+```elixir
+dto_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.select_shape(["order_number", {"status", "total"}])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(5)
+
+{:ok, dto_shape_rows} = Selecto.execute_shape(dto_shape_query)
+
+dto_map_rows =
+  Enum.map(dto_shape_rows, fn [order_number, {status, total}] ->
+    %{order_number: order_number, status_summary: %{status: status, total: total}}
+  end)
+
+[
+  %{format: "select_shape/2", sample: inspect(dto_shape_rows, limit: :infinity)},
+  %{format: "API DTO maps", sample: inspect(dto_map_rows, limit: :infinity)}
+]
+|> Kino.DataTable.new()
+```
+
+## 14) Retarget with Multiple Preserved Constraints
+
+Join-derived business rules can be normalized to root keys before retargeting,
+then preserved as part of the pre-retarget constraint.
+
+```elixir
+vip_customer_ids_query =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.select(select([id]))
+  |> Selecto.filter(where(tier == "vip"))
+
+{:ok, {vip_customer_id_rows, _columns, _aliases}} = Selecto.execute(vip_customer_ids_query)
+vip_customer_ids = List.flatten(vip_customer_id_rows)
+
+multi_preserved_retarget_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.filter(where(customer_id in ^vip_customer_ids))
+  |> Selecto.retarget(:order_items, subquery_strategy: :exists)
+  |> Selecto.select(select([as(order_items.product_id, "product_id"), as(order_items.quantity, "quantity")]))
+  |> Selecto.limit(10)
+
+SelectionFocus.Helpers.explain("Retarget with multiple preserved constraints", multi_preserved_retarget_query)
+```
+
+## 15) Challenge: Subselect Payload to Shaped Payload
+
+Convert an explicit subselect-style result into a shaped row payload when the
+consumer only needs nested structure.
+
+```elixir
+challenge_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name, total]))
+  |> Selecto.select_shape(["order_number", {"customer.name", "total"}])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(6)
+
+{:ok, challenge_shaped_rows} =
+  SelectionFocus.Helpers.run_shape("Challenge shaped customer payload", challenge_shape_query)
+
+Enum.map(challenge_shaped_rows, fn [order_number, {customer_name, total}] ->
+  %{order_number: order_number, customer: %{name: customer_name}, total: total}
+end)
+```
+
+## 16) DTO Helper for Common Shape Rows
+
+Package a common shaped-row conversion behind a small helper function.
+
+```elixir
+shape_to_order_dto = fn [order_number, {status, total}] ->
+  %{order_number: order_number, status_summary: %{status: status, total: total}}
+end
+
+Enum.map(dto_shape_rows, shape_to_order_dto)
+```
+
+## 17) Normalize Join Filters Before Retargeting
+
+Resolve join-based filter choices to root keys before retargeting.
+
+```elixir
+join_filter_request = %{customer_tier: "vip", status: "delivered"}
+
+{:ok, {normalized_customer_rows, _columns, _aliases}} =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.select(select([id]))
+  |> Selecto.filter(where(tier == ^join_filter_request.customer_tier))
+  |> Selecto.execute()
+
+normalized_root_filters = %{
+  status: join_filter_request.status,
+  customer_ids: List.flatten(normalized_customer_rows)
+}
+
+normalized_root_filters
+```
+
+## 18) Shape or Subselect Decision Challenge
+
+Choose between shapes and subselects based on the target API contract.
+
+```elixir
+api_contracts = [
+  %{contract: "flat order summary", recommended: "select/2", reason: "no nested payload needed"},
+  %{contract: "nested customer summary", recommended: "select_shape/2", reason: "fixed nested row structure"},
+  %{contract: "order with variable line item list", recommended: "subselect/3", reason: "child collection cardinality varies"}
+]
+
+Kino.DataTable.new(api_contracts)
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+* Add named helper modules for DTO conversions used across notebooks.
+* Add an executable retarget query from normalized root filters once list predicates preserve correctly.
+* Add side-by-side output examples for each API contract recommendation.

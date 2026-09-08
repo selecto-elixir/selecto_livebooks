@@ -1,0 +1,11 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/tmp/
+.DS_Store
+.expert/
+.elixir_ls/
+erl_crash.dump
+*.ez
+selecto_livebooks-*.tar

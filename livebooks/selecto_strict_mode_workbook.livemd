@@ -1,0 +1,168 @@
+# Selecto Strict Mode Workbook
+
+This workbook exercises the sealed query boundary added in Selecto 0.4.10.
+It needs no database: every example uses an explicit compile-only runtime.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Compose and validate the trusted domain
+
+Strict mode begins after the application has assembled and validated its
+domain. Domain-declared joins and SQL-backed compatibility fields remain
+available by governed name; the query caller cannot rewrite their structure.
+
+```elixir
+strict_domain = %{
+  name: "Strict orders",
+  source: %{
+    source_table: "orders",
+    primary_key: :id,
+    fields: [:id, :status, :total, :team_id],
+    redact_fields: [],
+    columns: %{
+      id: %{type: :integer},
+      status: %{type: :string},
+      total: %{type: :decimal},
+      team_id: %{type: :integer}
+    },
+    associations: %{
+      team: %{queryable: :team, field: :team, owner_key: :team_id, related_key: :id}
+    }
+  },
+  schemas: %{
+    team: %{
+      source_table: "teams",
+      primary_key: :id,
+      fields: [:id, :name],
+      redact_fields: [],
+      columns: %{id: %{type: :integer}, name: %{type: :string}},
+      associations: %{}
+    }
+  },
+  joins: %{
+    team: %{name: "Team", type: :left, display_field: :name}
+  },
+  custom_columns: %{
+    "status_upper" => %{select: "UPPER(selecto_root.status)", type: :string}
+  }
+}
+
+strict_query = Selecto.configure(strict_domain, Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only), mode: :strict)
+Selecto.Policy.strict?(strict_query)
+```
+
+## 2) Compile an ordinary governed query
+
+The join and custom column came from the sealed domain. The filter value stays
+in the parameter list.
+
+```elixir
+query =
+  strict_query
+  |> Selecto.join(:team)
+  |> Selecto.select(["status", "team.name", "status_upper"])
+  |> Selecto.filter({"status", "open"})
+  |> Selecto.order_by({"team.name", :asc})
+
+:ok = Selecto.Policy.validate_query!(query)
+{sql, params} = Selecto.to_sql(query)
+
+%{sql: sql, params: params, parameterized?: params == ["open"]}
+```
+
+## 3) Observe eager query-authored SQL rejection
+
+Strict mode rejects raw SQL at the public API and checks again at compilation.
+The example captures the expected exception so the notebook remains runnable.
+
+```elixir
+raw_sql_rejection =
+  try do
+    strict_query |> Selecto.select({:raw_sql, "current_user"})
+    :unexpectedly_allowed
+  rescue
+    error in Selecto.PolicyViolation -> Exception.message(error)
+  end
+
+raw_sql_rejection
+```
+
+## 4) Observe governed join enforcement
+
+A caller may enable `:team`, but cannot change its type, source, keys, or
+condition. Joins absent from the domain are rejected as well.
+
+```elixir
+join_override_rejection =
+  try do
+    strict_query |> Selecto.join(:team, type: :inner)
+    :unexpectedly_allowed
+  rescue
+    error in Selecto.PolicyViolation -> Exception.message(error)
+  end
+
+undeclared_join_rejection =
+  try do
+    strict_query
+    |> Selecto.join(:audit_log,
+      source: "audit_logs",
+      owner_key: :id,
+      related_key: :order_id
+    )
+
+    :unexpectedly_allowed
+  rescue
+    error in Selecto.PolicyViolation -> Exception.message(error)
+  end
+
+%{override: join_override_rejection, undeclared: undeclared_join_rejection}
+```
+
+## 5) Observe seal checks at the compiler boundary
+
+Even direct structure mutation cannot silently change the sealed source.
+
+```elixir
+tampered_query = put_in(strict_query.domain[:source][:source_table], "other_orders")
+
+seal_rejection =
+  try do
+    tampered_query |> Selecto.select(["id"]) |> Selecto.to_sql()
+    :unexpectedly_allowed
+  rescue
+    error in Selecto.PolicyViolation -> Exception.message(error)
+  end
+
+seal_rejection
+```
+
+## 6) Choose the domain-SQL profile deliberately
+
+The default `domain_sql: :declared` permits trusted SQL already in the sealed
+domain. `domain_sql: :forbid` rejects SQL-bearing domain entries during
+configuration.
+
+```elixir
+forbid_domain_sql_rejection =
+  try do
+    Selecto.configure(strict_domain, Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only),
+      mode: :strict,
+      domain_sql: :forbid
+    )
+
+    :unexpectedly_allowed
+  rescue
+    error in Selecto.PolicyViolation -> Exception.message(error)
+  end
+
+forbid_domain_sql_rejection
+```
+
+Strict mode is a governance boundary, not a BEAM process sandbox. Pair it with
+least-privilege database roles, tenant scoping, and database row-level security
+when those controls are part of the threat model.

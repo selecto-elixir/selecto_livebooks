@@ -1,0 +1,167 @@
+# Reusable Queries: Segments, Projections, Orderings, and Views
+
+How can a UI, export, and scheduled job share a query without copying SQL?
+Put reusable intent in the domain's query library. This database-free workbook
+uses the shipped DSL, compiles real SQL, and checks invalid input handling.
+It does not implement storage, a scheduler, or an authorization service.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Name the business concepts
+
+A segment filters rows; a projection controls output; an ordering makes the
+sequence deterministic; a view combines them. These are query definitions,
+not database `CREATE VIEW` objects or precomputed results.
+
+```elixir
+import ExUnit.Assertions
+
+defmodule OrderLibrary do
+  use Selecto.QueryLibrary.DSL
+
+  defsegment open_orders do
+    where(:status, eq: "open")
+  end
+
+  defsegment minimum_priority do
+    param(:minimum, :integer)
+    where(:priority, gte: param(:minimum))
+  end
+
+  defsegment actionable do
+    all_of do
+      segment(:open_orders)
+      segment(:minimum_priority)
+    end
+  end
+
+  defprojection identity do
+    fields([:id, :reference])
+  end
+
+  defprojection summary do
+    include_projection(:identity)
+    fields([:status, :priority])
+  end
+
+  defordering highest_priority do
+    order_by(:priority, :desc)
+    order_by(:id, :asc)
+  end
+
+  defview work_queue do
+    segment(:actionable)
+    projection(:summary)
+    ordering(:highest_priority)
+  end
+end
+
+domain = %{
+  name: "Reusable order queries",
+  source: %{
+    source_table: "orders",
+    primary_key: :id,
+    fields: [:id, :reference, :status, :priority, :visible],
+    redact_fields: [],
+    columns: %{
+      id: %{type: :integer}, reference: %{type: :string},
+      status: %{type: :string}, priority: %{type: :integer}, visible: %{type: :boolean}
+    },
+    associations: %{}
+  },
+  schemas: %{}, joins: %{},
+  required_filters: [{"visible", true}],
+  required_selected: [:id],
+  query_library: OrderLibrary.query_library()
+}
+
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only)
+base = Selecto.configure(domain, runtime, mode: :strict)
+```
+
+## 2) Apply a view with typed external parameters
+
+The integer parameter is cast from form input. The required visibility filter
+stays outside the optional segment; applying a view cannot remove it.
+
+```elixir
+queue = Selecto.apply_view(base, :work_queue, minimum: "2")
+{sql, params} = Selecto.to_sql(queue)
+assert true in params
+assert "open" in params
+assert 2 in params
+assert {"visible", true} in Selecto.query_filters(queue)
+assert queue.set.order_by == [{:priority, :desc}, {:id, :asc}]
+assert queue.set.selected == [:id, :reference, :status, :priority]
+assert Selecto.applied_query_library(queue).views == ["work_queue"]
+%{sql: sql, params: params, applied: Selecto.applied_query_library(queue)}
+```
+
+The applied-definition names are useful provenance. They are not security
+tokens, and this Elixir example does not claim they are emitted as SQL comments.
+
+## 3) Reuse just the parts you need
+
+An export can select identity fields without the full UI view. A projection
+replaces optional selections but preserves required domain selections. An
+ordering replaces optional ordering; `select/2` and `order_by/2` normally
+compose instead. Rebuild from `base` when choosing a different view.
+
+```elixir
+export_query =
+  base
+  |> Selecto.apply_segment(:open_orders)
+  |> Selecto.apply_projection(:identity)
+  |> Selecto.apply_ordering(:highest_priority)
+
+assert export_query.set.selected == [:id, :reference]
+assert {"visible", true} in Selecto.query_filters(export_query)
+assert base.set.filtered == []
+{export_sql, export_params} = Selecto.to_sql(export_query)
+%{sql: export_sql, params: export_params}
+```
+
+## 4) Reject invalid or incomplete requests before execution
+
+```elixir
+assert_raise ArgumentError, fn -> Selecto.apply_view(base, :missing_view) end
+assert_raise ArgumentError, fn -> Selecto.apply_view(base, :work_queue) end
+assert_raise ArgumentError, fn ->
+  Selecto.apply_view(base, :work_queue, minimum: "not-an-integer")
+end
+assert_raise ArgumentError, fn ->
+  Selecto.apply_view(base, :work_queue, minimum: 2, unexpected: "value")
+end
+```
+
+## 5) Store intent, not a connection or executable SQL
+
+An application can store a versioned request like this and reapply it against
+its currently authorized domain. This is a minimal request format, **not** a
+built-in persistence API. Validate versions, authorization, and parameter
+limits on every load; never deserialize a trusted runtime or executable code.
+
+```elixir
+saved_request = %{
+  "version" => 1,
+  "view" => "work_queue",
+  "params" => %{"minimum" => "3"}
+}
+
+assert saved_request["version"] == 1
+assert saved_request["view"] in ["work_queue"]
+restored = Selecto.apply_view(base, saved_request["view"], saved_request["params"])
+{_restored_sql, restored_params} = Selecto.to_sql(restored)
+assert 3 in restored_params
+assert true in restored_params
+```
+
+Extend this with tenant context supplied by the host, not saved form input:
+[tenant-scoped reads](selecto_tenant_reads_workbook.livemd). For nested reusable
+projections, combine the query library with
+[selection shapes and subselects](selecto_selection_shapes_subselects_retargets.livemd).

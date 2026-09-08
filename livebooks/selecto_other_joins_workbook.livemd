@@ -1,0 +1,572 @@
+# Selecto Other Joins Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook covers join patterns beyond basic dot-notation selection:
+
+1. Enabling a configured join with a different join type
+2. Parameterized joins (`join_parameterize/4`) for multiple aliases of the same relationship
+3. Subquery joins (`join_subquery/4`) for joining derived result sets
+4. Custom dynamic joins (`join/3`) to tables not declared as associations in the source schema
+5. Structured shaped output for advanced joins via `select_shape/2`
+
+```mermaid
+flowchart LR
+  base[Configure base query]
+  mode[Choose join strategy]
+  select[Select join fields]
+  filter[Apply filters]
+  sql[Inspect SQL and params]
+  run[Execute]
+
+  base --> mode --> select --> filter --> sql --> run
+```
+
+```mermaid
+graph LR
+  orders[orders]
+  customers[customers]
+  order_items[order_items]
+  subq[high_value_order_subquery]
+
+  orders -->|customer_id to id| customers
+  orders -->|id to order_id| order_items
+  customers -->|id to customer_id| subq
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Shared Repo and Build Domains
+
+This cell starts the shared sample-app repo, loads maintained domains from
+`selecto_livebooks`, and adds the customer join filter metadata needed for the
+parameterized join examples.
+
+```elixir
+base_config = SelectoLivebooks.NotebookSupport.config([:order_domain, :customer_domain, :order_items_domain])
+
+order_domain =
+  put_in(base_config.order_domain, [:joins, :customer, :filters], %{
+    "tier" => %{type: "string"},
+    "active" => %{type: "boolean"}
+  })
+
+config = %{base_config | order_domain: order_domain}
+
+counts = SelectoLivebooks.NotebookSupport.table_counts(["orders", "customers", "order_items"])
+order_count = counts["orders"]
+customer_count = counts["customers"]
+item_count = counts["order_items"]
+
+IO.puts("Connected. Orders: #{order_count}, Customers: #{customer_count}, Order items: #{item_count}")
+
+config
+```
+
+## Setup 3) Define Join Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule JoinLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+
+  def run(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+This workbook still keeps explicit string selection where parameterized alias
+names make that clearer, but ordinary filters, orders, and non-aliased joins now
+use the shipped expression DSL where it reads better.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+:ok
+```
+
+## 1) Join Type Override on a Configured Join
+
+The `customer` join is configured as `:left` in the domain. This cell enables that same join at runtime and overrides it to `:inner`.
+
+```elixir
+import Selecto.ExprMacros
+
+inner_customer_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:customer, type: :inner)
+  |> Selecto.select(select([order_number, status, total, customer.name, customer.tier, customer.country]))
+  |> Selecto.filter(where(customer.active == true))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Configured join with runtime type override", inner_customer_join_query)
+```
+
+## 2) Parameterized Join Aliases (`join_parameterize/4`)
+
+This creates two aliases of the same `customer` join (`customer:premium` and `customer:standard`) with different join filters.
+
+```elixir
+import Selecto.ExprMacros
+
+parameterized_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_parameterize(:customer, "premium", tier: "premium")
+  |> Selecto.join_parameterize(:customer, "standard", tier: "standard")
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "total",
+    "customer:premium.name",
+    "customer:standard.name"
+  ])
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Parameterized joins with tier filters", parameterized_join_query)
+```
+
+## 2.1) Parameterized Joins with `select_shape/2`
+
+Render parameterized join results in a nested row shape so premium and standard alias fields are grouped explicitly.
+
+```elixir
+parameterized_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_parameterize(:customer, "premium", tier: "premium")
+  |> Selecto.join_parameterize(:customer, "standard", tier: "standard")
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "total"},
+    {"customer:premium.name", "customer:standard.name"}
+  ])
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(10)
+
+{:ok, shaped_rows} =
+  JoinLab.Helpers.run_shape("Parameterized joins with select_shape", parameterized_shape_query)
+
+Enum.each(shaped_rows, fn [order_number, {status, total}, {premium_name, standard_name}] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} total=#{inspect(total)} " <>
+      "premium=#{inspect(premium_name)} standard=#{inspect(standard_name)}"
+  )
+end)
+
+:ok
+```
+
+## 3) Parameterized Join with Boolean Filter Variants
+
+You can also parameterize by boolean filters and compare active vs inactive customer matches side by side.
+
+```elixir
+active_vs_inactive_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_parameterize(:customer, "active_only", active: true)
+  |> Selecto.join_parameterize(:customer, "inactive_only", active: false)
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "customer:active_only.name",
+    "customer:inactive_only.name"
+  ])
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Parameterized joins with boolean filters", active_vs_inactive_query)
+```
+
+## 4) Subquery Join (`join_subquery/4`)
+
+Build a derived dataset of high-value delivered orders and join it into a customer query.
+
+```elixir
+import Selecto.ExprMacros
+
+high_value_delivered_orders =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([customer_id, order_number, total]))
+  |> Selecto.filter(where(status == "delivered" and total > 500))
+
+subquery_join_query =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.join_subquery(:high_value_delivered, high_value_delivered_orders,
+    type: :inner,
+    on: [%{left: "id", right: "customer_id"}]
+  )
+  |> Selecto.select(select([name, tier, country, high_value_delivered.order_number, high_value_delivered.total]))
+  |> Selecto.order_by(order_by([desc(high_value_delivered.total)]))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Subquery join for high-value delivered orders", subquery_join_query)
+```
+
+## 4.1) Subquery Join with `select_shape/2`
+
+Use `select_shape/2` on a subquery join.
+Note: a tuple/list containing only `high_value_delivered.*` fields is interpreted as a subselect node and currently fails for `join_subquery` aliases, so this shape keeps those fields flat and groups them in rendering.
+
+```elixir
+import Selecto.ExprMacros
+
+high_value_delivered_orders_shape =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([customer_id, order_number, total]))
+  |> Selecto.filter(where(status == "delivered" and total > 500))
+
+subquery_shape_query =
+  Selecto.configure(config.customer_domain, config.repo)
+  |> Selecto.join_subquery(:high_value_delivered, high_value_delivered_orders_shape,
+    type: :inner,
+    on: [%{left: "id", right: "customer_id"}]
+  )
+  |> Selecto.select_shape([
+    {"name", "tier", "country"},
+    "high_value_delivered.order_number",
+    "high_value_delivered.total"
+  ])
+  |> Selecto.order_by(order_by([desc(high_value_delivered.total)]))
+  |> Selecto.limit(10)
+
+{:ok, subquery_shaped_rows} =
+  JoinLab.Helpers.run_shape("Subquery join with select_shape", subquery_shape_query)
+
+Enum.each(subquery_shaped_rows, fn [{customer_name, tier, country}, order_number, total] ->
+  high_value_order = {order_number, total}
+
+  IO.puts(
+    "customer=#{customer_name} tier=#{tier} country=#{country} " <>
+      "order=#{elem(high_value_order, 0)} total=#{inspect(elem(high_value_order, 1))}"
+  )
+end)
+
+:ok
+```
+
+## 5) Custom Dynamic Join to an Unconfigured Table
+
+This adds a runtime join to `order_items` under a custom join id (`line_items_custom`) without relying on source associations.
+
+```elixir
+import Selecto.ExprMacros
+
+custom_dynamic_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:line_items_custom,
+    source: "order_items",
+    type: :left,
+    owner_key: :id,
+    related_key: :order_id,
+    fields: %{
+      product_id: %{type: :integer},
+      quantity: %{type: :integer},
+      line_total: %{type: :decimal}
+    }
+  )
+  |> Selecto.select(select([order_number, status, line_items_custom.product_id, line_items_custom.quantity, line_items_custom.line_total]))
+  |> Selecto.filter(where((status == "shipped" or status == "delivered") and line_items_custom.quantity >= 2))
+  |> Selecto.order_by(order_by([desc(line_items_custom.line_total)]))
+  |> Selecto.limit(15)
+
+JoinLab.Helpers.run("Custom dynamic join to order_items", custom_dynamic_join_query)
+```
+
+## 6) Custom Join Type Swap on Dynamic Join
+
+Switch the previous custom join from `:left` to `:inner` to require matching order items.
+
+```elixir
+import Selecto.ExprMacros
+
+custom_inner_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:line_items_custom,
+    source: "order_items",
+    type: :inner,
+    owner_key: :id,
+    related_key: :order_id,
+    fields: %{
+      quantity: %{type: :integer},
+      line_total: %{type: :decimal}
+    }
+  )
+  |> Selecto.select(select([order_number, status, line_items_custom.quantity, line_items_custom.line_total]))
+  |> Selecto.order_by(order_by([desc(line_items_custom.line_total)]))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Custom dynamic join with inner type", custom_inner_join_query)
+```
+
+## 8) Chain `join_subquery/4` with a CTE
+
+Prepare a CTE for high-value orders, then join a grouped subquery that summarizes
+line-item totals by order.
+
+```elixir
+line_item_totals_query =
+  Selecto.configure(config.order_items_domain, config.repo)
+  |> Selecto.select([
+    "order_id",
+    {:field, {:raw_sql, "SUM(selecto_root.line_total) AS line_total_sum"}, "line_total_sum"}
+  ])
+  |> Selecto.group_by(group_by([order_id]))
+
+cte_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([id, order_number, total]))
+    |> Selecto.filter(where(total >= 250))
+  end,
+    columns: ["id", "order_number", "total"],
+    join: [type: :inner, owner_key: :id, related_key: :id, fields: :infer]
+  )
+  |> Selecto.join_subquery(:line_item_totals, line_item_totals_query,
+    type: :left,
+    on: [%{left: "id", right: "order_id"}],
+    fields: %{line_total_sum: %{type: :decimal}}
+  )
+  |> Selecto.select(select([order_number, total, line_item_totals.line_total_sum]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("CTE plus join_subquery", cte_join_query)
+```
+
+## 9) Compare Left and Inner Join Row Counts
+
+This quick benchmark keeps the selected fields identical and changes only the
+custom join type.
+
+```elixir
+count_join_rows = fn join_type ->
+  query =
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.join(:line_items_compare,
+      source: "order_items",
+      type: join_type,
+      owner_key: :id,
+      related_key: :order_id,
+      fields: %{id: %{type: :integer}}
+    )
+    |> Selecto.select(select([id, line_items_compare.id]))
+
+  {micros, {:ok, {rows, _columns, _aliases}}} = :timer.tc(fn -> Selecto.execute(query) end)
+  %{join_type: join_type, rows: length(rows), elapsed_ms: Float.round(micros / 1000, 2)}
+end
+
+[:left, :inner]
+|> Enum.map(count_join_rows)
+|> Kino.DataTable.new()
+```
+
+## 10) Join Troubleshooting Snapshot
+
+When a joined field is missing, inspect registered joins and the generated SQL
+before changing the domain.
+
+```elixir
+troubleshooting_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name, order_items.quantity]))
+  |> Selecto.limit(5)
+
+{troubleshooting_sql, troubleshooting_params} = Selecto.to_sql(troubleshooting_query)
+
+%{
+  joins: Selecto.joins(troubleshooting_query),
+  sql: Selecto.format_sql(troubleshooting_sql),
+  params: troubleshooting_params
+}
+|> IO.inspect(label: "join troubleshooting snapshot", pretty: true)
+```
+
+## 11) Join Path Diagram from Query Metadata
+
+Turn `Selecto.joins/1` into a compact Mermaid diagram for review.
+
+```elixir
+join_path_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, customer.name, order_items.quantity]))
+  |> Selecto.limit(5)
+
+join_edges =
+  Selecto.joins(join_path_query)
+  |> Map.keys()
+  |> Enum.map(fn join_id ->
+    "  orders -->|#{join_id}| #{join_id}"
+  end)
+  |> Enum.join("\n")
+
+fence = String.duplicate("`", 3)
+
+Kino.Markdown.new("#{fence}mermaid\ngraph LR\n#{join_edges}\n#{fence}")
+```
+
+## 12) Ambiguous Fields Across Multiple Custom Joins
+
+When two custom joins expose the same field names, select through explicit join
+aliases so the generated SQL remains readable.
+
+```elixir
+ambiguous_custom_join_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:all_items,
+    source: "order_items",
+    type: :left,
+    owner_key: :id,
+    related_key: :order_id,
+    fields: %{quantity: %{type: :integer}, line_total: %{type: :decimal}}
+  )
+  |> Selecto.join(:bulk_items,
+    source: "order_items",
+    type: :left,
+    owner_key: :id,
+    related_key: :order_id,
+    fields: %{quantity: %{type: :integer}, line_total: %{type: :decimal}}
+  )
+  |> Selecto.select(select([order_number, all_items.quantity, bulk_items.quantity, all_items.line_total, bulk_items.line_total]))
+  |> Selecto.filter(where(bulk_items.quantity >= 2))
+  |> Selecto.limit(10)
+
+JoinLab.Helpers.run("Explicit aliases for ambiguous custom joins", ambiguous_custom_join_query, 10)
+```
+
+## 13) Dynamic Join vs Domain-Declared Join
+
+Compare a runtime dynamic join with the domain-declared association path for the
+same relationship.
+
+```elixir
+domain_declared_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, order_items.quantity, order_items.line_total]))
+  |> Selecto.limit(5)
+
+dynamic_equivalent_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:runtime_order_items,
+    source: "order_items",
+    type: :left,
+    owner_key: :id,
+    related_key: :order_id,
+    fields: %{quantity: %{type: :integer}, line_total: %{type: :decimal}}
+  )
+  |> Selecto.select(select([order_number, runtime_order_items.quantity, runtime_order_items.line_total]))
+  |> Selecto.limit(5)
+
+[
+  %{style: "domain-declared", sql: Selecto.to_sql(domain_declared_query) |> elem(0) |> Selecto.format_sql()},
+  %{style: "dynamic", sql: Selecto.to_sql(dynamic_equivalent_query) |> elem(0) |> Selecto.format_sql()}
+]
+|> Kino.DataTable.new()
+```
+
+## 14) Join Graph with Key Labels
+
+Include owner and related keys in the join graph so relationship direction is
+visible.
+
+```elixir
+join_graph_rows =
+  Selecto.joins(domain_declared_query)
+  |> Enum.map(fn {join_id, join_info} ->
+    join_config = join_info.config
+    on = List.first(join_config.on || [%{}])
+
+    %{
+      join: join_id,
+      source: join_config.source,
+      owner_key: on.left,
+      related_key: on.right,
+      mermaid: "orders -->|#{on.left} to #{on.right}| #{join_id}"
+    }
+  end)
+
+Kino.DataTable.new(join_graph_rows)
+```
+
+## 15) Duplicate Runtime Join Detection
+
+Detect runtime joins that point at the same source and key pair.
+
+```elixir
+runtime_join_specs = [
+  %{id: :items_a, source: "order_items", owner_key: :id, related_key: :order_id},
+  %{id: :items_b, source: "order_items", owner_key: :id, related_key: :order_id},
+  %{id: :customers, source: "customers", owner_key: :customer_id, related_key: :id}
+]
+
+runtime_join_specs
+|> Enum.group_by(fn spec -> {spec.source, spec.owner_key, spec.related_key} end)
+|> Enum.flat_map(fn {_signature, specs} ->
+  if length(specs) > 1 do
+    Enum.map(specs, &Map.put(&1, :duplicate?, true))
+  else
+    Enum.map(specs, &Map.put(&1, :duplicate?, false))
+  end
+end)
+|> Kino.DataTable.new()
+```
+
+## 16) Promote Dynamic Joins into Domain Metadata
+
+Use this checklist when a dynamic join appears in multiple notebooks or app
+views.
+
+```elixir
+[
+  %{signal: "same source/key pair appears repeatedly", action: "promote to domain join"},
+  %{signal: "join fields need labels or formats", action: "promote to domain join"},
+  %{signal: "one-off diagnostic query", action: "keep as dynamic join"}
+]
+|> Kino.DataTable.new()
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+1. Render the key-labeled join graph as Mermaid.
+2. Add duplicate detection against actual `Selecto.joins/1` metadata.
+3. Add an example that promotes a dynamic join into an overlay module.

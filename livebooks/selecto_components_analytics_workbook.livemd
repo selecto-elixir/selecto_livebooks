@@ -1,0 +1,144 @@
+# SelectoComponents Shared Analytics Workbook
+
+SelectoComponents 0.4.12 rebuilt Graph on Aggregate's analytical query shape.
+Columns can now carry intrinsic `default_grouping` and `default_aggregate`
+hints, while explicit domain-level defaults remain authoritative.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_components!()
+```
+
+## 1) Put analytical intent next to each column
+
+```elixir
+analytics_domain = %{
+  name: "Bookings",
+  source: %{
+    source_table: "bookings",
+    primary_key: :id,
+    fields: [:id, :booked_at, :region, :hours],
+    redact_fields: [],
+    columns: %{
+      id: %{type: :integer},
+      booked_at: %{type: :utc_datetime, default_grouping: :month},
+      region: %{type: :string, default_grouping: :default},
+      hours: %{type: :integer, default_aggregate: :sum}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  joins: %{}
+}
+
+analytics_selecto = Selecto.configure(analytics_domain, Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only))
+
+group_defaults = SelectoComponents.Views.Analytic.Defaults.group_by(analytics_selecto)
+aggregate_defaults = SelectoComponents.Views.Analytic.Defaults.aggregate(analytics_selecto)
+
+%{group_by: group_defaults, aggregate: aggregate_defaults}
+```
+
+## 2) Build the shared Aggregate/Graph query state
+
+Aggregate and Graph now use identical `group_by` and `aggregate` items. Graph
+adds only visual mapping. Copying an Aggregate query to Graph preserves the
+filters and Graph visual configuration.
+
+```elixir
+to_items = fn defaults, prefix ->
+  defaults
+  |> Enum.with_index(1)
+  |> Enum.map(fn {{field, config}, index} ->
+    {"#{prefix}-#{index}", field, config}
+  end)
+end
+
+view_config = %{
+  view_mode: "aggregate",
+  filters: [
+    {"active-region", "filters", %{"filter" => "region", "comp" => "!=", "value" => ""}}
+  ],
+  views: %{
+    aggregate: %{
+      group_by: to_items.(group_defaults, "group"),
+      aggregate: to_items.(aggregate_defaults, "aggregate")
+    },
+    graph: %{
+      group_by: [],
+      aggregate: [],
+      visual: %{type: "bar", series: [], options: %{"title" => "Hours by month"}}
+    }
+  }
+}
+
+graph_config = SelectoComponents.Form.ParamsState.copy_aggregate_to_graph(view_config)
+
+%{
+  view_mode: graph_config.view_mode,
+  filters_preserved?: graph_config.filters == view_config.filters,
+  group_by: graph_config.views.graph.group_by,
+  aggregate: graph_config.views.graph.aggregate,
+  visual: graph_config.views.graph.visual
+}
+```
+
+## 3) Override column hints at the domain level
+
+Existing domains can continue to provide explicit lists. A non-empty explicit
+list wins over the column-local hints.
+
+```elixir
+explicit_domain =
+  Map.merge(analytics_domain, %{
+    default_group_by: ["region"],
+    default_aggregate: [{"id", %{"format" => "count"}}]
+  })
+
+explicit_selecto = Selecto.configure(explicit_domain, Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, :compile_only))
+
+%{
+  group_by: SelectoComponents.Views.Analytic.Defaults.group_by(explicit_selecto),
+  aggregate: SelectoComponents.Views.Analytic.Defaults.aggregate(explicit_selecto)
+}
+```
+
+For overlay-authored domains, the equivalent column directives are
+`default_grouping/1` and `default_aggregate/1` inside `defcolumn`.
+
+## 4) Preserve Graph display state in URL parameters
+
+Graph's analytical query and its visual mapping are separate, but both need to
+round-trip. Current Components keeps chart type, title, axis labels, series,
+and color fields in encoded URL state.
+
+```elixir
+graph_url_params =
+  SelectoComponents.Form.ParamsState.view_config_to_params(graph_config)
+
+%{
+  chart_type: graph_url_params["graph_chart_type"],
+  options: graph_url_params["graph_options"],
+  group_by: graph_url_params["graph_group_by"],
+  aggregate: graph_url_params["graph_aggregate"]
+}
+```
+
+## 5) Normalize finite filter vocabularies
+
+Fields or filters with a finite `:options` vocabulary render as selects instead
+of free text. Scalars, Phoenix-style `{label, value}` tuples, and label/value
+maps normalize to a single `{value, label}` shape.
+
+```elixir
+SelectoComponents.Form.FilterRendering.static_filter_options(%{
+  type: :string,
+  options: [
+    "Ready to reserve",
+    {"Needs attention", "attention"},
+    %{label: "Retired", value: "retired"}
+  ]
+})
+```

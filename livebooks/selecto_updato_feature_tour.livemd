@@ -1,0 +1,386 @@
+# SelectoUpdato: Portable, Adapter-Owned Writes
+
+## Overview
+
+This notebook is a runnable tour of SelectoUpdato 0.4's flat write surface.
+Updato validates domain-governed intent and compiles a portable command; the
+configured database adapter owns SQL, driver interaction, transactions, and
+affected-row cardinality checks. The companion nested-write workbook continues
+from commands into atomic `Selecto.Write.Graph` execution.
+
+For named business operations, follow [domain actions](selecto_actions_workbook.livemd)
+and [guarded action execution](selecto_action_execution_workbook.livemd). They add
+input variants, capabilities, transitions and preconditions above the write surface.
+
+It uses Postgrex directly. There is no `Ecto.Repo`, schema, changeset, or Ecto
+configuration in this write path.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+
+SelectoLivebooksNotebookBootstrap.install_updato!()
+```
+
+## Bounded proof reports
+
+The packaged verification models check every state in four declared finite
+spaces. These are bounded proofs, not a claim about arbitrary adapters or host
+callbacks.
+
+```elixir
+write_safety_report = SelectoUpdato.Verification.WriteSafety.verify()
+action_safety_report = SelectoUpdato.Verification.ActionSafety.verify()
+portable_command_report = SelectoUpdato.Verification.PortableCommandSafety.verify()
+nested_graph_report = SelectoUpdato.Verification.NestedGraphSafety.verify()
+
+true = write_safety_report.proved?
+true = action_safety_report.proved?
+true = portable_command_report.proved?
+true = nested_graph_report.proved?
+688 =
+  Enum.sum([
+    write_safety_report.check_count,
+    action_safety_report.check_count,
+    portable_command_report.check_count,
+    nested_graph_report.check_count
+  ])
+
+%{
+  write_scope: Map.take(write_safety_report, [:proof_level, :state_count, :check_count]),
+  action_capability: Map.take(action_safety_report, [:proof_level, :state_count, :check_count]),
+  portable_command:
+    Map.take(portable_command_report, [:proof_level, :state_count, :check_count]),
+  nested_graph: Map.take(nested_graph_report, [:proof_level, :state_count, :check_count])
+}
+```
+
+## The boundary
+
+```mermaid
+flowchart LR
+  Domain["Domain writes policy"] --> Updato["SelectoUpdato"]
+  Context["Trusted tenant and account context"] --> Updato
+  Updato --> Command["Selecto.Write.Command"]
+  Updato --> Graph["Selecto.Write.Graph"]
+  Command --> Adapter["SelectoDBPostgreSQL.Adapter"]
+  Graph --> Adapter
+  Adapter --> Postgrex["Postgrex connection"]
+```
+
+The domain grants the operation, writable fields, tenant scope, cardinality,
+and foreign-key source. A caller cannot replace those policies with request
+parameters.
+
+## Setup: a direct Postgrex connection and isolated tables
+
+The setup uses Postgrex only to create isolated demonstration tables. Temporary
+tables belong to one PostgreSQL session, so this notebook deliberately uses a
+single-connection pool. The write examples below go through the Selecto write
+adapter, not raw SQL.
+
+```elixir
+connection_config =
+  SelectoLivebooksNotebookBootstrap.repo_config()
+  |> Keyword.put(:pool_size, 1)
+
+{:ok, connection} = Postgrex.start_link(connection_config)
+
+run_suffix = System.unique_integer([:positive, :monotonic])
+accounts_table = "updato_feature_tour_accounts_#{run_suffix}"
+items_table = "updato_feature_tour_items_#{run_suffix}"
+run_id = "updato-#{run_suffix}"
+
+Postgrex.query!(connection, """
+CREATE TEMP TABLE #{accounts_table} (
+  id bigint PRIMARY KEY,
+  tenant_id bigint NOT NULL
+)
+""", [])
+
+Postgrex.query!(connection, """
+CREATE TEMP TABLE #{items_table} (
+  id bigserial PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  account_id bigint NOT NULL,
+  external_id text NOT NULL,
+  name text NOT NULL,
+  state text NOT NULL DEFAULT 'open',
+  UNIQUE (tenant_id, external_id)
+)
+""", [])
+
+tenant_id = 70_001
+account_id = 80_001
+
+Postgrex.query!(
+  connection,
+  "INSERT INTO #{accounts_table} (id, tenant_id) VALUES ($1, $2)",
+  [account_id, tenant_id]
+)
+
+%Postgrex.Result{rows: [[^account_id, ^tenant_id]]} =
+  Postgrex.query!(
+    connection,
+    "SELECT id, tenant_id FROM #{accounts_table} WHERE id = $1",
+    [account_id]
+  )
+```
+
+## Domain policy and configured Selecto
+
+This workbook uses the default-branch colocated authoring form: field write
+policy lives beside each source column. Selecto normalizes it into canonical
+`writes.fields` before Updato sees the domain. `account_id` is context-sourced:
+it is not accepted from user input. The adapter receives a reference guard so
+the insert can only succeed if the account exists. The tenant comes from
+trusted execution context and is bound into every update and delete predicate.
+
+```elixir
+domain = %{
+  name: "Updato feature-tour items",
+  source: %{
+    source_table: items_table,
+    primary_key: :id,
+    fields: [:id, :tenant_id, :account_id, :external_id, :name, :state],
+    columns: %{
+      id: %{type: :integer, write: %{server_managed: true}},
+      tenant_id: %{type: :integer, write: %{insertable: true, immutable: true}},
+      account_id: %{type: :integer, write: %{insertable: true, immutable: true}},
+      external_id: %{
+        type: :string,
+        write: %{insertable: true, immutable: true, required_on: [:insert]}
+      },
+      name: %{
+        type: :string,
+        write: %{insertable: true, updatable: true, required_on: [:insert]}
+      },
+      state: %{type: :string, write: %{insertable: true, updatable: true}}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  writes: %{
+    operations: %{
+      insert: %{
+        enabled: true,
+        expected_cardinality: {:exactly, 1},
+        returning: :all
+      },
+      update: %{
+        enabled: true,
+        expected_cardinality: {:exactly, 1},
+        returning: :all
+      },
+      upsert: %{
+        enabled: true,
+        expected_cardinality: {:exactly, 1},
+        conflict_targets: [[:tenant_id, :external_id]],
+        returning: :all
+      },
+      delete: %{enabled: true, expected_cardinality: {:exactly, 1}}
+    },
+    scope: %{tenant: %{required: true, field: :tenant_id}},
+    constraints: %{
+      foreign_keys: %{
+        account_id: %{
+          source: {:context, :account_id},
+          references: %{relation: accounts_table, field: :id},
+          required: true
+        }
+      }
+    }
+  }
+}
+
+selecto = %Selecto{
+  domain: domain,
+  adapter: SelectoDBPostgreSQL.Adapter,
+  connection: connection
+}
+
+context = %{tenant_id: tenant_id, account_id: account_id}
+```
+
+## Required fields fail before adapter dispatch
+
+`required_on: [:insert]` is domain policy, not a database error translated
+after the fact. The portable compiler returns a structured validation error
+before preview or execution can reach the configured adapter.
+
+```elixir
+missing_name_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.insert(%{external_id: "missing-name"})
+
+{:error,
+ %SelectoUpdato.Error{
+   type: :validation,
+   details: %{errors: [{["name"], "is required"}]}
+ }} = SelectoUpdato.preview(missing_name_operation, selecto, context: context)
+```
+
+## Adapter conformance without mutation
+
+The core conformance suite asks the configured adapter to preview every
+portable operation plus an atomic batch. It validates advertised transaction
+capabilities and preview shapes without executing a write.
+
+```elixir
+{:ok, adapter_conformance} =
+  Selecto.Write.AdapterConformance.check(selecto,
+    relation: items_table,
+    context: context
+  )
+
+%{
+  operations: adapter_conformance.operations,
+  capabilities: adapter_conformance.capabilities,
+  batch_statement_count: length(adapter_conformance.batch_preview.statements)
+}
+```
+
+## Preview: adapter-owned parameterized SQL
+
+Updato produces portable command data. The PostgreSQL adapter turns it into a
+parameterized preview; values are parameters, not SQL fragments.
+
+```elixir
+insert_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.insert(%{external_id: run_id, name: "Portable write tour", state: "open"})
+  |> SelectoUpdato.returning([:id, :name, :state])
+
+{:ok, preview} = SelectoUpdato.preview(insert_operation, selecto, context: context)
+preview
+```
+
+## Insert with context-owned tenant and foreign key
+
+Neither `tenant_id` nor `account_id` appears in the attributes. Updato adds
+them only from trusted context, then the adapter executes and enforces the
+domain's exact-one cardinality.
+
+```elixir
+{:ok, inserted} = SelectoUpdato.execute(insert_operation, selecto, context: context)
+inserted
+```
+
+## Update: tenant scope cannot be forged
+
+The user-level predicate identifies the row; trusted tenant context scopes it.
+A caller-provided tenant filter may agree, but a mismatched one is rejected
+before SQL is sent.
+
+```elixir
+update_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.filter({:external_id, run_id})
+  |> SelectoUpdato.update(%{name: "Renamed by portable command", state: "active"})
+  |> SelectoUpdato.returning([:id, :name, :state])
+
+{:ok, updated} = SelectoUpdato.execute(update_operation, selecto, context: context)
+updated
+```
+
+```elixir
+forged_tenant_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.filter({:tenant_id, tenant_id + 1})
+  |> SelectoUpdato.filter({:external_id, run_id})
+  |> SelectoUpdato.update(%{state: "forged"})
+
+SelectoUpdato.execute(forged_tenant_operation, selecto, context: context)
+```
+
+## Upsert with a domain-owned conflict target
+
+Conflict behavior is deliberately narrow: the domain enables `upsert` and owns
+its one allowed conflict target, so Updato derives it without accepting policy
+from the caller. Only `name` and `state` are eligible for the conflict update;
+the tenant, account, and external identifier remain immutable.
+
+```elixir
+upsert_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.upsert(%{external_id: run_id, name: "Upserted portable write", state: "active"})
+  |> SelectoUpdato.returning([:id, :name, :state])
+
+{:ok, upsert_preview} = SelectoUpdato.preview(upsert_operation, selecto, context: context)
+IO.inspect(upsert_preview, label: "Upsert preview")
+
+%Postgrex.Result{rows: [[^account_id]]} =
+  Postgrex.query!(connection, "SELECT id FROM #{accounts_table} WHERE id = $1", [account_id])
+
+{:ok, upserted} = SelectoUpdato.execute(upsert_operation, selecto, context: context)
+upserted
+```
+
+## Transactional cardinality rollback
+
+Portable commands carry expected cardinality. The PostgreSQL adapter executes
+an individual command in a transaction, so a mismatch rolls back the tentative
+mutation instead of returning an error after a partial commit.
+
+```elixir
+{:ok, rollback_probe} =
+  Selecto.Write.Command.new(%{
+    operation: :update,
+    relation: items_table,
+    assignments: [%{field: :state, value: {:literal, "should-roll-back"}}],
+    predicate:
+      {:and,
+       [
+         {:eq, {:field, :tenant_id}, {:literal, tenant_id}},
+         {:eq, {:field, :external_id}, {:literal, run_id}}
+       ]},
+    expected_cardinality: {:exactly, 2}
+  })
+
+{:error, rollback_error} =
+  SelectoDBPostgreSQL.Adapter.execute_write(connection, rollback_probe)
+
+:cardinality_mismatch = rollback_error.type
+
+%Postgrex.Result{rows: [["active"]]} =
+  Postgrex.query!(
+    connection,
+    "SELECT state FROM #{items_table} WHERE tenant_id = $1 AND external_id = $2",
+    [tenant_id, run_id]
+  )
+
+%{error: rollback_error, persisted_state: "active"}
+```
+
+## Delete and cleanup
+
+Delete requires a predicate and inherits trusted tenant scope. There is no
+bulk-delete confirmation switch, soft-delete helper, cascade option, changeset,
+or SQL escape hatch in the portable API.
+
+```elixir
+delete_operation =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.filter({:external_id, run_id})
+  |> SelectoUpdato.delete()
+
+{:ok, deleted} = SelectoUpdato.execute(delete_operation, selecto, context: context)
+GenServer.stop(connection)
+
+deleted
+```
+
+## What this tour intentionally does not provide
+
+The previous implementation taught repositories, schemas, changesets, legacy
+multi-step nested orchestration, custom conflict strategies, callbacks,
+cascades, and SQL emitted by Updato. Those paths remain intentionally absent.
+Nested writes returned in 0.4 as domain-governed, adapter-neutral atomic graphs;
+the companion `selecto_updato_nested_writes_workbook.livemd` exercises that new
+contract. New write features must first be portable data, then be implemented
+by each adapter that can safely support them.

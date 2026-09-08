@@ -1,0 +1,132 @@
+# Tenant-Scoped Reads: Trusted Context and Fail-Closed Queries
+
+Business question: can an optional UI filter or another tenant's row ID widen
+the authorized result set? This workbook checks the answer against real
+PostgreSQL results, not just a generated WHERE clause.
+
+Requires an existing PostgreSQL database via `SELECTO_LIVEBOOKS_DB*`. It uses
+the same synthetic, session-local temporary table as the pagination workbook.
+No Ecto Repo, migrations, seeds, permanent writes, or schema-per-tenant setup.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Keep domain and tenant authority in the application
+
+The fixture domain requires a tenant and always filters `visible = true`.
+`trusted_tenant_id` stands for a value resolved by your authenticated host.
+It must not come from request parameters or a saved-query/cursor payload.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/workflow_fixture.exs", __DIR__))
+connection = SelectoLivebooks.WorkflowFixture.connect!()
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, connection)
+domain = SelectoLivebooks.WorkflowFixture.domain()
+base = Selecto.configure(domain, runtime, mode: :strict)
+trusted_tenant_id = 101
+```
+
+## 2) Metadata alone is not an applied row filter
+
+Both a missing tenant and a tenant that has only been attached fail validation.
+Compilation fails closed until the matching required row filter is applied.
+
+```elixir
+assert {:error, %Selecto.Error{type: :validation_error}} = Selecto.validate_tenant_scope(base)
+assert_raise RuntimeError, ~r/Tenant scope is required but missing/, fn ->
+  base |> Selecto.select(["id"]) |> Selecto.to_sql()
+end
+
+attached = Selecto.with_tenant(base, tenant_id: trusted_tenant_id)
+assert {:error, %Selecto.Error{}} = Selecto.validate_tenant_scope(attached)
+
+scoped = Selecto.apply_tenant_scope(attached)
+assert :ok = Selecto.validate_tenant_scope(scoped)
+assert {"tenant_id", 101} in Selecto.required_filters(scoped)
+```
+
+## 3) Prove the visible result set
+
+```elixir
+identity_query =
+  scoped
+  |> Selecto.select(["id", "reference"])
+  |> Selecto.order_by({"id", :asc})
+
+{:ok, {rows, _columns, _aliases}} = Selecto.execute(identity_query)
+assert rows == [[1, "A"], [2, "B"], [3, "C"], [6, "D"]]
+{sql, params} = Selecto.to_sql(identity_query)
+assert true in params
+assert 101 in params
+%{sql: sql, params: params, rows: rows}
+```
+
+## 4) Optional filters cannot OR away the required scope
+
+Even a predicate mentioning tenant 202 stays inside the required tenant 101
+and visibility constraints. An incompatible optional equality returns no rows;
+it does not switch tenants.
+
+```elixir
+optional_or = Selecto.filter(identity_query, {:or, [
+  {"status", "open"}, {"tenant_id", 202}
+]})
+{:ok, {or_rows, _, _}} = Selecto.execute(optional_or)
+assert or_rows == [[1, "A"], [2, "B"], [6, "D"]]
+
+{:ok, {[], _, _}} =
+  identity_query |> Selecto.filter({"tenant_id", 202}) |> Selecto.execute()
+
+{:ok, {[], _, _}} =
+  identity_query |> Selecto.filter({"id", 5}) |> Selecto.execute()
+```
+
+This demonstrates defense in depth, not a recommendation to accept arbitrary
+filter ASTs from clients. Expose a small, typed filter allowlist or authorized
+query-library views at your application's boundary.
+
+## 5) Reject conflicting trusted context and caller-authored SQL
+
+```elixir
+assert_raise ArgumentError, fn ->
+  Selecto.apply_tenant_scope(scoped, tenant_id: 202)
+end
+
+mismatched = Selecto.require_tenant_filter(attached, "tenant_id", 202)
+assert {:error, %Selecto.Error{details: %{code: :tenant_scope_mismatch}}} =
+  Selecto.validate_tenant_scope(mismatched)
+
+assert_raise Selecto.PolicyViolation, fn ->
+  Selecto.select(scoped, {:raw_sql, "current_user"})
+end
+
+other_tenant_query =
+  base
+  |> Selecto.with_tenant(tenant_id: 202)
+  |> Selecto.apply_tenant_scope()
+  |> Selecto.select(["id", "reference"])
+
+{:ok, {[[5, "OTHER-TENANT"]], _, _}} = Selecto.execute(other_tenant_query)
+{:ok, {^rows, _, _}} = Selecto.execute(identity_query)
+```
+
+Build each request from the trusted base; do not mutate or recycle a scoped
+query across tenants. Required root scope is not automatic authorization of
+every possible joined table. Design relationship keys and tenant policies
+together (including composite tenant keys where needed), and use database
+roles/RLS when appropriate. Strict mode is not a sandbox for arbitrary BEAM
+code. These examples prove only the stated read cases, not the whole app.
+
+## 6) Clean up
+
+```elixir
+:ok = GenServer.stop(connection)
+```
+
+For writes, use the separate [Updato tour](selecto_updato_feature_tour.livemd)
+and its domain-owned operation, field, relationship, and cardinality policies.

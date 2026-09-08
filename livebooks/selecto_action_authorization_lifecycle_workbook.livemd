@@ -1,0 +1,108 @@
+# Action Authorization Grants and Replay Safety
+
+An action plan is not permission to mutate. Authorization is phase-bound,
+identity-bound, short-lived, and consumed once. This workbook exercises that
+lifecycle without a database.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Plan first, authorize later
+
+```elixir
+import ExUnit.Assertions
+
+assert {:ok, plan} = SelectoUpdato.plan_domain_action(
+  Selecto.Domain.Examples.work_items(),
+  %{action: :archive, target: 7}
+)
+assert %SelectoUpdato.PlannedOperation{} = plan.operation_builder
+
+resolver = fn request, context, _opts ->
+  if request.phase == :execute and context.actor.id == 17, do: :enabled, else: :hidden
+end
+context = %{actor: %{id: 17}, tenant: %{tenant_id: 101}}
+
+assert {:ok, authorized, decision, grant} =
+  SelectoUpdato.ActionAuthorization.authorize_and_issue(
+    plan, :execute, context, capability_resolver: resolver
+  )
+assert decision.status == :enabled
+assert is_reference(grant)
+```
+
+## 2) Consume exactly once
+
+The adapter receives this evidence in its context. Passing it through unchanged
+lets command compilation consume the grant. Here we call the grant boundary
+directly to isolate replay behavior from a database adapter.
+
+```elixir
+assert {:ok, authorization_context} =
+  SelectoUpdato.ActionAuthorization.authorization_context(context)
+evidence = %{
+  action: authorized.action,
+  capability: authorized.capability,
+  operation: authorized.operation_builder.type,
+  operation_fingerprint:
+    SelectoUpdato.ActionAuthorization.operation_fingerprint(authorized.operation_builder),
+  phase: :execute,
+  authorization_context: authorization_context
+}
+
+assert :ok = SelectoUpdato.ActionAuthorization.consume(grant, evidence)
+assert {:error, %SelectoUpdato.Error{
+  type: :authorization,
+  details: %{code: :unregistered_action_authorization}
+}} = SelectoUpdato.ActionAuthorization.consume(grant, evidence)
+```
+
+## 3) Bind the grant to the immutable plan
+
+Changing the target on the opaque pre-authorization plan is rejected before an
+adapter can receive it.
+
+```elixir
+defmodule AuthorizationProbeAdapter do
+  def execute_action(_plan, _context, _opts), do: {:ok, :unexpected_execution}
+end
+
+altered = %{plan | target: %{"id" => 99}}
+assert {:error, {:validation_error, _message, %{code: :action_policy_mismatch}}} =
+  SelectoUpdato.ActionExecutionAdapter.execute(
+    AuthorizationProbeAdapter, altered, context, capability_resolver: resolver
+  )
+```
+
+## 4) Expire unused permission
+
+The tiny TTL is only for this deterministic example. Production values should
+cover the expected request hop while remaining bounded.
+
+```elixir
+assert {:ok, _authorized3, _decision3, grant3} =
+  SelectoUpdato.ActionAuthorization.authorize_and_issue(
+    plan, :execute, context,
+    capability_resolver: resolver,
+    action_authorization_grant_ttl: 5
+  )
+Process.sleep(25)
+
+assert {:error, %SelectoUpdato.Error{
+  type: :authorization,
+  details: %{code: :unregistered_action_authorization}
+}} = SelectoUpdato.ActionAuthorization.consume(grant3, %{
+  action: plan.action, capability: plan.capability,
+  operation: :update, phase: :execute
+})
+```
+
+Preview and execute require separate authorization calls. Never serialize the
+opaque plan handle or grant into a durable job or browser-owned token.
+See [domain actions](selecto_actions_workbook.livemd) for capability decisions
+and [guarded execution](selecto_action_execution_workbook.livemd) for consumption
+inside a real write.

@@ -1,0 +1,789 @@
+# Selecto CTEs Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook focuses on CTE workflows in Selecto:
+
+1. Non-recursive CTE (`with_cte/4`) for reusable aggregate subqueries
+2. CTE-enriched result sets via explicit CTE joins
+3. Recursive CTE (`with_recursive_cte/3`) for hierarchy traversal
+4. Multiple CTE composition (`with_ctes/3` + `joins:` shortcut)
+5. Shaped CTE output with `select_shape/2` and `execute_shape/2`
+
+```mermaid
+flowchart LR
+  base[Base query]
+  addcte[Attach CTE]
+  joincte[Join CTE into main query]
+  select[Select fields]
+  execute[Execute]
+
+  base --> addcte --> joincte --> select --> execute
+```
+
+```mermaid
+graph LR
+  employees[employees]
+  manager[employees as manager]
+  tree[employee tree CTE]
+
+  employees -->|manager_id to id| manager
+  employees -->|id to id| tree
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Domains
+
+This cell defines:
+
+1. `order_domain` for order-focused CTE examples
+2. `employee_domain` for recursive hierarchy CTE examples
+
+```elixir
+defmodule CteLab.Repo do
+  use Ecto.Repo,
+    otp_app: :cte_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule CteLab.Domains do
+  @moduledoc false
+
+  def order_domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [:id, :order_number, :status, :total, :customer_id, :inserted_at],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          customer_id: %{type: :integer},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{
+          customer: %{field: :customer, queryable: :customers, owner_key: :customer_id, related_key: :id}
+        }
+      },
+      schemas: %{
+        customers: %{
+          source_table: "customers",
+          primary_key: :id,
+          fields: [:id, :name, :tier, :active],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            name: %{type: :string},
+            tier: %{type: :string},
+            active: %{type: :boolean}
+          }
+        }
+      },
+      joins: %{
+        customer: %{
+          name: "Customer",
+          type: :left,
+          source: "customers",
+          on: [%{left: "customer_id", right: "id"}],
+          fields: %{
+            name: %{type: :string},
+            tier: %{type: :string},
+            active: %{type: :boolean}
+          }
+        }
+      },
+      default_selected: ["order_number", "status", "total", "inserted_at"],
+      default_order_by: [{"inserted_at", :desc}]
+    }
+  end
+
+  def employee_domain do
+    %{
+      name: "Employees",
+      source: %{
+        source_table: "employees",
+        primary_key: :id,
+        fields: [:id, :first_name, :last_name, :email, :title, :department, :salary, :manager_id, :active],
+        columns: %{
+          id: %{type: :integer},
+          first_name: %{type: :string},
+          last_name: %{type: :string},
+          email: %{type: :string},
+          title: %{type: :string},
+          department: %{type: :string},
+          salary: %{type: :decimal},
+          manager_id: %{type: :integer},
+          active: %{type: :boolean}
+        },
+        associations: %{
+          manager: %{field: :manager, queryable: :employees, owner_key: :manager_id, related_key: :id}
+        }
+      },
+      schemas: %{
+        employees: %{
+          source_table: "employees",
+          primary_key: :id,
+          fields: [:id, :first_name, :last_name, :email, :title, :department, :salary, :manager_id, :active],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            first_name: %{type: :string},
+            last_name: %{type: :string},
+            email: %{type: :string},
+            title: %{type: :string},
+            department: %{type: :string},
+            salary: %{type: :decimal},
+            manager_id: %{type: :integer},
+            active: %{type: :boolean}
+          }
+        }
+      },
+      joins: %{
+        manager: %{
+          name: "Manager",
+          type: :left,
+          source: "employees",
+          on: [%{left: "manager_id", right: "id"}],
+          fields: %{
+            first_name: %{type: :string},
+            last_name: %{type: :string},
+            title: %{type: :string}
+          }
+        }
+      },
+      default_selected: ["first_name", "last_name", "title", "department"],
+      default_order_by: [{"last_name", :asc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_LIVEBOOKS_DB", "selecto_livebooks_dev"),
+  username: System.get_env("SELECTO_LIVEBOOKS_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_LIVEBOOKS_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_LIVEBOOKS_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_LIVEBOOKS_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(CteLab.Repo) do
+  nil -> {:ok, _pid} = CteLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: CteLab.Repo,
+  order_domain: CteLab.Domains.order_domain(),
+  employee_domain: CteLab.Domains.employee_domain()
+}
+
+{:ok, order_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+{:ok, employee_result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from employees", [])
+[[order_count]] = order_result.rows
+[[employee_count]] = employee_result.rows
+
+IO.puts("Connected. Orders: #{order_count}, Employees: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define CTE Helpers
+
+This helper cell prints SQL/params and executes the query with a compact preview.
+
+```elixir
+defmodule CteLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    {sql, params} = Selecto.to_sql(query)
+
+    IO.puts("\n=== #{label} ===")
+    IO.puts(String.trim(sql))
+    IO.puts("Params: #{inspect(params)}")
+    IO.puts("Has WITH clause: #{String.contains?(String.downcase(sql), "with ")}")
+
+    {sql, params}
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    explain(label, query)
+
+    case Selecto.execute(query) do
+      {:ok, {rows, columns, aliases}} = ok ->
+        IO.puts("Rows: #{length(rows)}")
+        IO.puts("Columns: #{inspect(columns)}")
+        IO.puts("Aliases: #{inspect(aliases)}")
+        IO.inspect(Enum.take(rows, preview_count), label: "Preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    explain(label, query)
+    IO.inspect(query.set.selection_shape, label: "Compiled shape plan", pretty: true, limit: :infinity)
+
+    case Selecto.execute_shape(query) do
+      {:ok, shaped_rows} = ok ->
+        IO.puts("Shaped rows: #{length(shaped_rows)}")
+        IO.inspect(Enum.take(shaped_rows, preview_count), label: "Shape preview (up to #{preview_count} rows)")
+        ok
+
+      {:error, error} = failure ->
+        IO.puts("Error: #{inspect(error)}")
+        failure
+    end
+  end
+end
+```
+
+## 1) Non-Recursive CTE: Manager Team Metrics
+
+Create a CTE that aggregates direct reports per manager, then join it back to employees to retrieve manager identity fields.
+
+```elixir
+manager_metrics_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_cte("manager_team_metrics", fn ->
+    Selecto.configure(config.employee_domain, config.repo)
+    |> Selecto.select([
+      "manager_id",
+      {:count, "*"},
+      {:sum, "salary"}
+    ])
+    |> Selecto.filter({"manager_id", :not_null})
+    |> Selecto.group_by(["manager_id"])
+  end,
+  columns: ["manager_id", "direct_report_count", "team_salary_total"],
+  join: [type: :inner, owner_key: :id, related_key: :manager_id, fields: :infer]
+  )
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "title",
+    "manager_team_metrics.direct_report_count",
+    "manager_team_metrics.team_salary_total"
+  ])
+  |> Selecto.filter({"manager_team_metrics.direct_report_count", {:>=, 2}})
+  |> Selecto.order_by({"manager_team_metrics.direct_report_count", :desc})
+  |> Selecto.limit(10)
+
+CteLab.Helpers.run("Non-recursive CTE: manager metrics", manager_metrics_query)
+```
+
+## 2) Non-Recursive CTE: Customer Lifetime Spend Buckets
+
+Build a customer-level revenue CTE, join it to orders, and filter for high-value customers.
+
+```elixir
+customer_spend_cte_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("customer_spend", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select([
+      "customer_id",
+      {:count, "*"},
+      {:sum, "total"}
+    ])
+    |> Selecto.group_by(["customer_id"])
+  end,
+  columns: ["customer_id", "order_count", "lifetime_spend"],
+  join: [type: :inner, owner_key: :customer_id, related_key: :customer_id, fields: :infer]
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "customer.name",
+    "customer.tier",
+    "customer_spend.order_count",
+    "customer_spend.lifetime_spend"
+  ])
+  |> Selecto.filter({"customer_spend.order_count", {:>=, 2}})
+  |> Selecto.order_by({"customer_spend.lifetime_spend", :desc})
+  |> Selecto.limit(10)
+
+CteLab.Helpers.run("Non-recursive CTE: customer spend", customer_spend_cte_query)
+```
+
+## 3) Recursive CTE: Reporting Tree from an Anchor Employee
+
+This example anchors on one email and expands the reporting tree recursively through `manager_id`.
+
+```elixir
+anchor_email = "sarah.connor@company.com"
+
+base_query = fn ->
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_id",
+    {:literal, 0}
+  ])
+  |> Selecto.filter({"email", anchor_email})
+end
+
+recursive_query = fn _cte_ref ->
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.join(:employee_tree,
+    source: "employee_tree",
+    type: :inner,
+    owner_key: :manager_id,
+    related_key: :id,
+    fields: %{
+      id: %{type: :integer},
+      first_name: %{type: :string},
+      last_name: %{type: :string},
+      manager_id: %{type: :integer},
+      depth: %{type: :integer}
+    }
+  )
+  |> Selecto.select([
+    "id",
+    "first_name",
+    "last_name",
+    "manager_id",
+    {:raw_sql, "employee_tree.depth + 1"}
+  ])
+  |> Selecto.filter({"employee_tree.id", :not_null})
+end
+
+recursive_tree_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.with_recursive_cte("employee_tree",
+    base_query: base_query,
+    recursive_query: recursive_query,
+    columns: ["id", "first_name", "last_name", "manager_id", "depth"],
+    join: [type: :inner, owner_key: :id, related_key: :id, fields: :infer]
+  )
+  |> Selecto.select([
+    "employee_tree.depth",
+    "employee_tree.first_name",
+    "employee_tree.last_name",
+    "title",
+    "manager.first_name",
+    "manager.last_name"
+  ])
+  |> Selecto.order_by({"employee_tree.depth", :asc})
+  |> Selecto.order_by({"employee_tree.last_name", :asc})
+  |> Selecto.limit(20)
+
+CteLab.Helpers.run("Recursive CTE: employee reporting tree", recursive_tree_query)
+```
+
+## 4) Multiple CTEs with `with_ctes/3`
+
+Compose two CTEs, attach both to the same query, and auto-join them with `joins:` metadata.
+
+```elixir
+alias Selecto.Advanced.CTE
+
+high_value_orders_cte =
+  CTE.create_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.filter({"total", {:>, 500}})
+  end, columns: ["id", "customer_id", "total"])
+
+customer_order_counts_cte =
+  CTE.create_cte("customer_order_counts", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["customer_id", {:count, "*"}])
+    |> Selecto.group_by(["customer_id"])
+  end, columns: ["customer_id", "order_count"])
+
+multi_cte_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_ctes([high_value_orders_cte, customer_order_counts_cte],
+    joins: [
+      [name: "high_value_orders", type: :inner, owner_key: :id, related_key: :id, fields: :infer],
+      [
+        name: "customer_order_counts",
+        type: :inner,
+        owner_key: :customer_id,
+        related_key: :customer_id,
+        fields: :infer
+      ]
+    ]
+  )
+  |> Selecto.select([
+    "order_number",
+    "status",
+    "customer.name",
+    "high_value_orders.total",
+    "customer_order_counts.order_count"
+  ])
+  |> Selecto.filter({"customer_order_counts.order_count", {:>=, 2}})
+  |> Selecto.order_by({"high_value_orders.total", :desc})
+  |> Selecto.limit(10)
+
+CteLab.Helpers.run("Multiple CTE composition", multi_cte_query)
+```
+
+## 5) Multiple CTEs with `select_shape/2`
+
+Use the same multi-CTE pattern but return a structured, nested row shape so each result is easier to consume in Elixir.
+
+```elixir
+alias Selecto.Advanced.CTE
+
+high_value_orders_cte_shape =
+  CTE.create_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["id", "customer_id", "total"])
+    |> Selecto.filter({"total", {:>, 500}})
+  end, columns: ["id", "customer_id", "total"])
+
+customer_order_counts_cte_shape =
+  CTE.create_cte("customer_order_counts", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(["customer_id", {:count, "*"}])
+    |> Selecto.group_by(["customer_id"])
+  end, columns: ["customer_id", "order_count"])
+
+multi_cte_shape_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_ctes([high_value_orders_cte_shape, customer_order_counts_cte_shape],
+    joins: [
+      [name: "high_value_orders", type: :inner, owner_key: :id, related_key: :id, fields: :infer],
+      [
+        name: "customer_order_counts",
+        type: :inner,
+        owner_key: :customer_id,
+        related_key: :customer_id,
+        fields: :infer
+      ]
+    ]
+  )
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "customer.name"},
+    {"high_value_orders.total", "customer_order_counts.order_count"}
+  ])
+  |> Selecto.filter({"customer_order_counts.order_count", {:>=, 2}})
+  |> Selecto.order_by({"high_value_orders.total", :desc})
+  |> Selecto.limit(10)
+
+{:ok, shaped_rows} = CteLab.Helpers.run_shape("Multiple CTE composition with select_shape", multi_cte_shape_query)
+
+Enum.each(shaped_rows, fn [order_number, {status, customer_name}, {order_total, repeat_count}] ->
+  IO.puts(
+    "order=#{order_number} status=#{status} customer=#{customer_name} " <>
+      "cte_total=#{inspect(order_total)} repeat_orders=#{repeat_count}"
+  )
+end)
+
+:ok
+```
+
+## 9) CTE Feeding Post-Filter Pivot Analysis
+
+Use a CTE to isolate delivered orders first, then run a compact customer-tier
+analysis from the staged relation.
+
+```elixir
+import Selecto.ExprMacros
+
+delivered_tier_pivot_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("delivered_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([id, customer_id, total]))
+    |> Selecto.filter(where(status == "delivered"))
+  end,
+    columns: ["id", "customer_id", "total"],
+    join: [type: :inner, owner_key: :id, related_key: :id, fields: :infer]
+  )
+  |> Selecto.select(select([customer.tier, as(count(), "delivered_count"), as(sum(delivered_orders.total), "delivered_total")]))
+  |> Selecto.group_by(group_by([customer.tier]))
+  |> Selecto.limit(10)
+
+CteLab.Helpers.run("CTE-fed delivered-tier pivot", delivered_tier_pivot_query)
+```
+
+## 10) Monthly Pre-Aggregation with Window Ranking
+
+Pre-aggregate monthly totals in a CTE, then add a window rank over those monthly
+rows.
+
+```elixir
+import Selecto.ExprMacros
+
+monthly_rank_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("monthly_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select([
+      {:field, {:raw_sql, "MIN(id)"}, "representative_order_id"},
+      {:field, {:raw_sql, "date_trunc('month', inserted_at)"}, "order_month"}
+    ])
+    |> Selecto.select(select([as(count(), "order_count"), as(sum(total), "gross_total")]))
+    |> Selecto.group_by([{:raw_sql, "date_trunc('month', inserted_at)"}])
+  end,
+    columns: ["representative_order_id", "order_month", "order_count", "gross_total"],
+    join: [type: :inner, owner_key: :id, related_key: :representative_order_id, fields: :infer]
+  )
+  |> Selecto.select([
+    {:field, "monthly_orders.order_month", "order_month"},
+    {:field, "monthly_orders.order_count", "order_count"},
+    {:field, "monthly_orders.gross_total", "gross_total"}
+  ])
+  |> Selecto.window_function(:dense_rank, [],
+    over: [order_by: [{"monthly_orders.gross_total", :desc}]],
+    as: "revenue_rank"
+  )
+  |> Selecto.order_by({"monthly_orders.order_month", :asc})
+  |> Selecto.limit(24)
+
+CteLab.Helpers.run("Monthly CTE with revenue rank", monthly_rank_query)
+```
+
+## 11) CTE Versus Inline Subquery Readability
+
+The SQL generated by both styles is inspectable. Use this cell to compare which
+shape makes the business step easier to review.
+
+```elixir
+import Selecto.ExprMacros
+
+inline_high_value_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join_subquery(:high_value_inline,
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([id, total]))
+    |> Selecto.filter(where(total >= 250)),
+    type: :inner,
+    on: [%{left: "id", right: "id"}],
+    fields: %{total: %{type: :decimal}}
+  )
+  |> Selecto.select(select([order_number, status, high_value_inline.total]))
+  |> Selecto.limit(10)
+
+[
+  %{style: "with_cte/4", sql: Selecto.to_sql(delivered_tier_pivot_query) |> elem(0) |> Selecto.format_sql()},
+  %{style: "join_subquery/4", sql: Selecto.to_sql(inline_high_value_query) |> elem(0) |> Selecto.format_sql()}
+]
+|> Kino.DataTable.new()
+```
+
+## 12) Recursive CTE Hierarchy Traversal
+
+Use a recursive CTE to walk the employee manager hierarchy and keep a readable
+path for each row.
+
+```elixir
+{:ok, hierarchy_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH RECURSIVE employee_tree AS (
+    SELECT
+      id,
+      first_name,
+      last_name,
+      manager_id,
+      0 AS depth,
+      (first_name || ' ' || last_name)::text AS path
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT
+      employee.id,
+      employee.first_name,
+      employee.last_name,
+      employee.manager_id,
+      employee_tree.depth + 1,
+      employee_tree.path || ' > ' || employee.first_name || ' ' || employee.last_name
+    FROM employees employee
+    JOIN employee_tree ON employee.manager_id = employee_tree.id
+  )
+  SELECT id, first_name, last_name, depth, path
+  FROM employee_tree
+  ORDER BY path
+  LIMIT 20
+  """, [])
+
+hierarchy_rows.rows
+```
+
+## 13) Named CTE Columns for Shaped Output
+
+Explicit CTE column names make downstream `select_shape/2` payloads easier to
+read and harder to confuse with base-table fields.
+
+```elixir
+named_columns_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("customer_order_summary", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select([
+      "customer_id",
+      {:field, {:raw_sql, "COUNT(*)"}, "summary_order_count"},
+      {:field, {:raw_sql, "SUM(selecto_root.total)"}, "summary_total"}
+    ])
+    |> Selecto.group_by(["customer_id"])
+  end,
+    columns: ["customer_id", "summary_order_count", "summary_total"],
+    join: [type: :inner, owner_key: :customer_id, related_key: :customer_id, fields: :infer]
+  )
+  |> Selecto.select([
+    "order_number",
+    "customer_order_summary.summary_order_count",
+    "customer_order_summary.summary_total"
+  ])
+  |> Selecto.limit(10)
+
+{:ok, {named_rows, _columns, _aliases}} =
+  CteLab.Helpers.run("Named CTE columns for output payloads", named_columns_query, 10)
+
+Enum.map(named_rows, fn [order_number, order_count, total] ->
+  %{order_number: order_number, customer_summary: %{order_count: order_count, total: total}}
+end)
+```
+
+## 14) EXPLAIN: Repeated CTE vs Repeated Inline Subquery
+
+Compare planning output for a reusable CTE and a similar inline subquery pattern.
+
+```elixir
+cte_sql = """
+WITH high_value_orders AS (
+  SELECT id, total
+  FROM orders
+  WHERE total >= 500
+)
+SELECT count(*), sum(total)
+FROM high_value_orders
+"""
+
+inline_sql = """
+SELECT count(*), sum(total)
+FROM (
+  SELECT id, total
+  FROM orders
+  WHERE total >= 500
+) high_value_orders
+"""
+
+explain_text = fn label, sql ->
+  {:ok, result} = Ecto.Adapters.SQL.query(config.repo, "EXPLAIN (FORMAT TEXT) " <> sql, [])
+
+  %{
+    style: label,
+    plan: result.rows |> List.flatten() |> Enum.join("\n")
+  }
+end
+
+[
+  explain_text.("CTE", cte_sql),
+  explain_text.("Inline subquery", inline_sql)
+]
+|> Kino.DataTable.new()
+```
+
+## 15) Recursive CTE Cycle Protection
+
+Add an explicit path array to stop malformed hierarchy data from looping
+forever.
+
+```elixir
+{:ok, cycle_safe_tree} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH RECURSIVE employee_tree AS (
+    SELECT id, manager_id, ARRAY[id] AS path, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT employee.id, employee.manager_id, employee_tree.path || employee.id, employee_tree.depth + 1
+    FROM employees employee
+    JOIN employee_tree ON employee.manager_id = employee_tree.id
+    WHERE NOT employee.id = ANY(employee_tree.path)
+  )
+  SELECT id, manager_id, depth, path
+  FROM employee_tree
+  ORDER BY path
+  LIMIT 20
+  """, [])
+
+cycle_safe_tree.rows
+```
+
+## 16) Materialized vs Not Materialized CTE Hints
+
+PostgreSQL can accept materialization hints for CTEs. Compare the plans so the
+choice is visible.
+
+```elixir
+hinted_plan = fn hint ->
+  sql = """
+  WITH high_value AS #{hint} (
+    SELECT id, total FROM orders WHERE total >= 500
+  )
+  SELECT count(*), sum(total) FROM high_value
+  """
+
+  {:ok, result} = Ecto.Adapters.SQL.query(config.repo, "EXPLAIN (FORMAT TEXT) " <> sql, [])
+  %{hint: hint, plan: result.rows |> List.flatten() |> Enum.join("\n")}
+end
+
+[hinted_plan.("MATERIALIZED"), hinted_plan.("NOT MATERIALIZED")]
+|> Kino.DataTable.new()
+```
+
+## 17) CTE Staged from Input-Like Filters
+
+Use a map shaped like Livebook input output to stage a filtered CTE.
+
+```elixir
+filter_inputs = %{status: "delivered", min_total: Decimal.new("300")}
+
+input_staged_sql = """
+WITH filtered_orders AS (
+  SELECT id, order_number, status, total
+  FROM orders
+  WHERE status = $1 AND total >= $2
+)
+SELECT order_number, status, total
+FROM filtered_orders
+ORDER BY total DESC
+LIMIT 10
+"""
+
+{:ok, input_staged_rows} =
+  Ecto.Adapters.SQL.query(config.repo, input_staged_sql, [filter_inputs.status, filter_inputs.min_total])
+
+input_staged_rows.rows
+```
+
+## Next Steps
+
+To extend this CTE workbook further, add:
+
+1. Add a failing synthetic cycle fixture and show the protected query surviving it
+2. Add timing samples alongside materialized/not-materialized plan text
+3. Replace the staged filter map with `Kino.Input` controls

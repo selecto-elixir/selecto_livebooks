@@ -1,0 +1,138 @@
+# Interactive Action Form Lifecycle
+
+Selecto Components can turn domain action metadata into a LiveComponent request,
+while the host owns authorization, preview, apply, reload, and error formatting.
+This workbook exercises that message boundary without starting a browser.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Build the form from the domain action
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+
+domain = SelectoLivebooks.ActionFixture.domain()
+form_action = SelectoComponents.Actions.form_action(domain.actions.record_review,
+  id: :record_review, endpoint_base: "/api/actions")
+
+assert form_action.id == "record_review"
+assert form_action.preview_link == "/api/actions/record_review/preview"
+assert form_action.apply_link == "/api/actions/record_review/apply"
+assert form_action.required_inputs == ["accepted"]
+
+{effective, variant} =
+  SelectoComponents.Actions.effective_inputs(form_action, %{"accepted" => false})
+assert variant == "needs_work"
+assert Enum.map(effective, & &1["id"]) == ["accepted", "reason"]
+```
+
+## 2) Let the modal construct a preview request
+
+`update/2` initializes defaults just as LiveView would. The event emits a host
+message; it does not call an endpoint or execute a write by itself.
+
+```elixir
+{:ok, modal_socket} =
+  SelectoComponents.Modal.ActionFormModal.mount(%Phoenix.LiveView.Socket{assigns: %{__changed__: %{}}})
+
+{:ok, modal_socket} =
+  SelectoComponents.Modal.ActionFormModal.update(
+    %{id: "review-form", action: form_action, target: %{id: 42}, record: %{"id" => 42}},
+    modal_socket
+  )
+
+assert {:noreply, previewing_socket} =
+  SelectoComponents.Modal.ActionFormModal.handle_event(
+    "submit_action_form",
+    %{
+      "intent" => "preview",
+      "inputs" => %{"accepted" => "false", "reason" => "Missing packing details"}
+    },
+    modal_socket
+  )
+
+assert previewing_socket.assigns.submitting == "preview"
+assert_receive {:selecto_action_form_submit, preview_payload}
+assert preview_payload.action_id == "record_review"
+assert preview_payload.request["dry_run"] == true
+assert preview_payload.request["inputs"]["reason"] == "Missing packing details"
+```
+
+## 3) Route preview through host callbacks
+
+The host can authorize each intent independently. Its result is assigned back to
+the modal state in a JSON-safe envelope.
+
+```elixir
+host_socket = %Phoenix.LiveView.Socket{
+  assigns: %{
+    __changed__: %{},
+    modal_detail_data: %{component_assigns: %{submitting: "preview"}}
+  }
+}
+
+authorize = fn action_id, _request, _socket, intent ->
+  if action_id == "record_review" and intent == :preview, do: :ok, else: {:error, :capability_denied}
+end
+
+preview = fn action_id, request, _socket ->
+  {:ok, %{action: action_id, normalized_inputs: request["inputs"], changes: %{note: request["inputs"]["reason"]}}}
+end
+
+assert {:noreply, host_socket} =
+  SelectoComponents.ActionFormHost.handle_submit(host_socket, preview_payload,
+    preview: preview,
+    apply: fn _, _, _ -> {:error, :unexpected_apply} end,
+    authorize: authorize
+  )
+
+preview_result = host_socket.assigns.modal_detail_data.component_assigns.last_result
+assert preview_result["status"] == "ok"
+assert preview_result["intent"] == "preview"
+assert preview_result["payload"]["changes"]["note"] == "Missing packing details"
+```
+
+## 4) Apply, reload, and surface denial
+
+The apply callback returns an outcome. `after_apply` represents the host's data
+refresh and the helper emits a message that the parent LiveView can handle.
+
+```elixir
+apply_payload = %{
+  preview_payload |
+  intent: "apply",
+  request: preview_payload.request |> Map.put("dry_run", false) |> Map.put("confirmed", true)
+}
+
+assert {:noreply, applied_socket} =
+  SelectoComponents.ActionFormHost.handle_submit(host_socket, apply_payload,
+    preview: preview,
+    apply: fn action_id, request, _socket ->
+      {:ok, %{action: action_id, affected_rows: 1, inputs: request["inputs"]}}
+    end,
+    authorize: fn _, _, _, intent -> if intent == :apply, do: :ok, else: {:error, :capability_denied} end,
+    after_apply: fn socket, _result -> {socket, %{reload: %{record_ids: [42]}}} end
+  )
+
+assert_receive {:selecto_action_form_applied, applied_message}
+assert applied_message.reload == %{"record_ids" => [42]}
+assert applied_socket.assigns.modal_detail_data.component_assigns.last_result["intent"] == "apply"
+
+assert {:noreply, denied_socket} =
+  SelectoComponents.ActionFormHost.handle_submit(host_socket, apply_payload,
+    preview: preview, apply: fn _, _, _ -> {:ok, :should_not_run} end,
+    authorize: fn _, _, _, _ -> {:error, :capability_denied} end
+  )
+assert denied_socket.assigns.modal_detail_data.component_assigns.last_error == "Action is not allowed."
+```
+
+Rendering and browser interaction still belong in a Phoenix LiveView test. This
+workbook verifies the real component/host state machine and request contract.
+Continue with [guarded execution](selecto_action_execution_workbook.livemd) for
+the PostgreSQL apply boundary.

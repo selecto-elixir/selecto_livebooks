@@ -1,0 +1,763 @@
+# Selecto VALUES and Inline Lookup Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook demonstrates `with_values/3` for inline lookup tables and ad hoc reference data.
+
+1. Add a literal lookup table using row lists
+2. Join inline lookup to base query rows
+3. Use map rows with inferred columns
+4. Treat VALUES tables as priority metadata without physical schema changes
+
+```mermaid
+flowchart LR
+  base[orders]
+  values[WITH ... VALUES inline table]
+  join[join inline table]
+  select[select mapped fields]
+  output[result rows]
+
+  base --> join
+  values --> join --> select --> output
+```
+
+```mermaid
+graph TD
+  status[order status]
+  labels[status_labels VALUES]
+  priority[priority VALUES]
+
+  status --> labels
+  status --> priority
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Order Domain
+
+This cell defines a local Repo and order domain for VALUES join examples.
+
+```elixir
+defmodule ValuesLab.Repo do
+  use Ecto.Repo,
+    otp_app: :values_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule ValuesLab.OrderDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Orders",
+      source: %{
+        source_table: "orders",
+        primary_key: :id,
+        fields: [
+          :id,
+          :order_number,
+          :status,
+          :total,
+          :shipping_country,
+          :inserted_at,
+          :customer_id
+        ],
+        columns: %{
+          id: %{type: :integer},
+          order_number: %{type: :string},
+          status: %{type: :string},
+          total: %{type: :decimal},
+          shipping_country: %{type: :string},
+          inserted_at: %{type: :utc_datetime},
+          customer_id: %{type: :integer}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["order_number", "status", "total"],
+      default_order_by: [{"total", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_LIVEBOOKS_DB", "selecto_livebooks_dev"),
+  username: System.get_env("SELECTO_LIVEBOOKS_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_LIVEBOOKS_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_LIVEBOOKS_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_LIVEBOOKS_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(ValuesLab.Repo) do
+  nil -> {:ok, _pid} = ValuesLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: ValuesLab.Repo,
+  order_domain: ValuesLab.OrderDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from orders", [])
+[[order_count]] = result.rows
+IO.puts("Connected. Orders in dataset: #{order_count}")
+
+config
+```
+
+## Setup 3) Define VALUES Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule ValuesLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    Selecto.Livebook.explain(label, query)
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    IO.inspect(query.set.selection_shape, label: "Compiled shape", pretty: true)
+    Selecto.Livebook.run_shape(label, query, preview_count: preview_count)
+  end
+
+  def with_lookup(selecto, lookup_meta) do
+    join_id = Map.get(lookup_meta, :join_id, lookup_meta.as |> to_string() |> String.to_atom())
+    join_type = Map.get(lookup_meta, :join_type, :left)
+
+    join_fields =
+      Map.get(lookup_meta, :fields) ||
+        Enum.into(lookup_meta.columns, %{}, fn column ->
+          {String.to_atom(column), %{type: :string}}
+        end)
+
+    selecto
+    |> Selecto.with_values(
+      lookup_meta.rows,
+      columns: lookup_meta.columns,
+      as: lookup_meta.as,
+      join: [
+        id: join_id,
+        type: join_type,
+        owner_key: lookup_meta.owner_key,
+        related_key: lookup_meta.related_key,
+        fields: join_fields
+      ]
+    )
+  end
+
+  def status_lookup_meta(version) do
+    case to_string(version) do
+      "v2" ->
+        %{
+          as: "status_labels",
+          columns: ["status", "status_label"],
+          rows: [
+            ["processing", "In Progress"],
+            ["shipped", "On The Way"],
+            ["delivered", "Delivered"],
+            ["cancelled", "Canceled"]
+          ],
+          owner_key: :status,
+          related_key: :status,
+          fields: %{
+            status: %{type: :string},
+            status_label: %{type: :string}
+          }
+        }
+
+      _ ->
+        %{
+          as: "status_labels",
+          columns: ["status", "status_label"],
+          rows: [
+            ["processing", "In Progress"],
+            ["shipped", "In Transit"],
+            ["delivered", "Completed"],
+            ["cancelled", "Cancelled"]
+          ],
+          owner_key: :status,
+          related_key: :status,
+          fields: %{
+            status: %{type: :string},
+            status_label: %{type: :string}
+          }
+        }
+    end
+  end
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+This workbook keeps the `with_values/3` configuration explicit, but now uses the
+current expression DSL for the surrounding select, filter, and order steps.
+
+```elixir
+import Selecto.ExprMacros
+
+:ok
+```
+
+## 1) Basic Inline Status Label Mapping
+
+Define a small status-to-label table inline and join it to orders.
+
+```elixir
+import Selecto.ExprMacros
+
+status_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      ["processing", "In Progress"],
+      ["shipped", "In Transit"],
+      ["delivered", "Completed"],
+      ["cancelled", "Cancelled"]
+    ],
+    columns: ["status", "status_label"],
+    as: "status_labels",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        status_label: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, status, status_labels.status_label, total]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("Inline status labels", status_lookup_query)
+```
+
+## 2) Map-Row VALUES with Inferred Columns
+
+Provide values as maps and let Selecto infer the columns.
+
+```elixir
+import Selecto.ExprMacros
+
+status_priority_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", priority_rank: 3, customer_label: "Open"},
+      %{status: "shipped", priority_rank: 2, customer_label: "On The Way"},
+      %{status: "delivered", priority_rank: 1, customer_label: "Complete"},
+      %{status: "cancelled", priority_rank: 4, customer_label: "Cancelled"}
+    ],
+    as: "status_priority",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        priority_rank: %{type: :integer},
+        customer_label: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, status, status_priority.priority_rank, status_priority.customer_label, total]))
+  |> Selecto.order_by(order_by([asc(status_priority.priority_rank)]))
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("Map-row VALUES with inferred columns", status_priority_query)
+```
+
+## 3) Inline Lookup for Shipping Region Buckets
+
+Create an inline table that classifies shipping countries into coarse geographic buckets.
+
+```elixir
+import Selecto.ExprMacros
+
+region_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      ["USA", "North America"],
+      ["Canada", "North America"],
+      ["Mexico", "North America"],
+      ["UK", "Europe"],
+      ["Germany", "Europe"],
+      ["France", "Europe"]
+    ],
+    columns: ["shipping_country", "region_bucket"],
+    as: "country_region_map",
+    join: [
+      owner_key: :shipping_country,
+      related_key: :shipping_country,
+      fields: %{
+        shipping_country: %{type: :string},
+        region_bucket: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, shipping_country, country_region_map.region_bucket, total]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(20)
+
+ValuesLab.Helpers.run("Inline country-region lookup", region_lookup_query)
+```
+
+## 4) Compare Two VALUES Strategies Side-by-Side
+
+Run list-row and map-row styles in one pass to compare SQL and output readability.
+
+```elixir
+comparison_queries = [
+  {"List-row VALUES", status_lookup_query},
+  {"Map-row VALUES", status_priority_query}
+]
+
+Enum.each(comparison_queries, fn {label, query} ->
+  ValuesLab.Helpers.run(label, query, 5)
+end)
+
+:ok
+```
+
+## 5) Staged Lookup Logic with `with_values/3` + `with_cte/4`
+
+Build a high-value-order CTE, then enrich those rows with inline status-group metadata.
+
+```elixir
+import Selecto.ExprMacros
+
+staged_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_cte("high_value_orders", fn ->
+    Selecto.configure(config.order_domain, config.repo)
+    |> Selecto.select(select([id, status, total]))
+    |> Selecto.filter(where(total >= 150))
+  end,
+  columns: ["id", "status", "total"],
+  join: [type: :inner, owner_key: :id, related_key: :id, fields: :infer]
+  )
+  |> Selecto.with_values(
+    [
+      ["processing", "In-flight"],
+      ["shipped", "In-flight"],
+      ["delivered", "Closed"],
+      ["cancelled", "Closed"]
+    ],
+    columns: ["status", "status_group"],
+    as: "status_group_lookup",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        status_group: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, status, status_group_lookup.status_group, high_value_orders.total]))
+  |> Selecto.order_by(order_by([desc(high_value_orders.total)]))
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run("CTE + VALUES staged lookup", staged_lookup_query, 10)
+```
+
+## 6) Priority-Scored Business Sorting
+
+Inline lookup rank controls display order first, then monetary value breaks ties.
+
+```elixir
+import Selecto.ExprMacros
+
+priority_scored_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", business_rank: 1, board_bucket: "Needs attention"},
+      %{status: "shipped", business_rank: 2, board_bucket: "In transit"},
+      %{status: "delivered", business_rank: 3, board_bucket: "Completed"},
+      %{status: "cancelled", business_rank: 4, board_bucket: "Closed exception"}
+    ],
+    as: "status_business_priority",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        business_rank: %{type: :integer},
+        board_bucket: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, status, status_business_priority.business_rank, status_business_priority.board_bucket, total]))
+  |> Selecto.order_by(order_by([asc(status_business_priority.business_rank)]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(20)
+
+ValuesLab.Helpers.run("Business-priority ordering via VALUES", priority_scored_query, 10)
+```
+
+## 7) Shaped Lookup Payloads with `select_shape/2`
+
+Package lookup-enriched values into nested tuples for API-ready output structures.
+`select_shape/2` defines the final projection, so you do not need a preceding `select/2` in the same query chain.
+
+```elixir
+shaped_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.with_values(
+    [
+      %{status: "processing", priority_rank: 3, customer_label: "Open"},
+      %{status: "shipped", priority_rank: 2, customer_label: "On The Way"},
+      %{status: "delivered", priority_rank: 1, customer_label: "Complete"},
+      %{status: "cancelled", priority_rank: 4, customer_label: "Cancelled"}
+    ],
+    as: "status_priority_shape",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        priority_rank: %{type: :integer},
+        customer_label: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select_shape([
+    "order_number",
+    {"status", "status_priority_shape.customer_label"},
+    {"status_priority_shape.priority_rank", "total"}
+  ])
+  |> Selecto.order_by({"status_priority_shape.priority_rank", :asc})
+  |> Selecto.order_by({"total", :desc})
+  |> Selecto.limit(15)
+
+ValuesLab.Helpers.run_shape("Shaped VALUES lookup output", shaped_lookup_query, 10)
+```
+
+## 8) Inline Lookup Versioning Pattern
+
+Swap lookup rows by environment/version while keeping query structure unchanged.
+
+```elixir
+import Selecto.ExprMacros
+
+lookup_version = System.get_env("VALUES_LOOKUP_VERSION", "v1")
+status_lookup_meta = ValuesLab.Helpers.status_lookup_meta(lookup_version)
+
+versioned_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> ValuesLab.Helpers.with_lookup(status_lookup_meta)
+  |> Selecto.select(select([order_number, status, status_labels.status_label, total]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+ValuesLab.Helpers.run("Versioned inline lookup (#{lookup_version})", versioned_lookup_query, 10)
+```
+
+## 9) VALUES Lookup vs Persisted Lookup-Table Join
+
+Compare behavior using a persisted lookup table (`livebook_status_lookup`) with the same mapping.
+
+```elixir
+import Selecto.ExprMacros
+
+status_rows = ValuesLab.Helpers.status_lookup_meta("v1").rows
+
+Ecto.Adapters.SQL.query!(
+  config.repo,
+  """
+  CREATE TABLE IF NOT EXISTS livebook_status_lookup (
+    status text PRIMARY KEY,
+    status_label text NOT NULL
+  )
+  """,
+  []
+)
+
+Enum.each(status_rows, fn [status, status_label] ->
+  Ecto.Adapters.SQL.query!(
+    config.repo,
+    """
+    INSERT INTO livebook_status_lookup (status, status_label)
+    VALUES ($1, $2)
+    ON CONFLICT (status) DO UPDATE SET status_label = EXCLUDED.status_label
+    """,
+    [status, status_label]
+  )
+end)
+
+values_lookup_compare_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> ValuesLab.Helpers.with_lookup(ValuesLab.Helpers.status_lookup_meta("v1"))
+  |> Selecto.select(select([order_number, status, status_labels.status_label, total]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+persisted_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.join(:livebook_status_lookup,
+    source: "livebook_status_lookup",
+    type: :left,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{
+      status: %{type: :string},
+      status_label: %{type: :string}
+    }
+  )
+  |> Selecto.select(select([order_number, status, livebook_status_lookup.status_label, total]))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(10)
+
+ValuesLab.Helpers.explain("VALUES lookup", values_lookup_compare_query)
+ValuesLab.Helpers.explain("Persisted lookup table", persisted_lookup_query)
+
+ValuesLab.Helpers.run("VALUES lookup results", values_lookup_compare_query, 10)
+ValuesLab.Helpers.run("Persisted lookup results", persisted_lookup_query, 10)
+```
+
+## 10) Assert Lookup Row Completeness
+
+Use a small assertion helper before running lookup joins so missing reference
+rows fail loudly.
+
+```elixir
+defmodule ValuesLab.LookupAssertions do
+  @moduledoc false
+
+  def assert_complete!(lookup_meta, expected_keys) do
+    actual_keys = MapSet.new(lookup_meta.rows, fn [key | _rest] -> key end)
+    missing_keys = expected_keys |> MapSet.new() |> MapSet.difference(actual_keys) |> MapSet.to_list()
+
+    if missing_keys == [] do
+      :ok
+    else
+      raise ArgumentError, "lookup #{lookup_meta.as} missing keys: #{inspect(missing_keys)}"
+    end
+  end
+end
+
+expected_statuses = ["processing", "shipped", "delivered", "cancelled"]
+ValuesLab.LookupAssertions.assert_complete!(ValuesLab.Helpers.status_lookup_meta(:v2), expected_statuses)
+
+IO.puts("Status lookup covers #{Enum.join(expected_statuses, ", ")}")
+```
+
+## 11) Inspect Plans and Execution with `EXPLAIN ANALYZE`
+
+Compare the inline VALUES lookup and persisted lookup with the same selected
+fields and ordering.
+
+`EXPLAIN ANALYZE` actually executes the query and adds measurement overhead.
+Use only the controlled SELECT examples here against the disposable sample
+database. These tiny-fixture plans are not production performance evidence.
+
+```elixir
+plan_lookup = fn label, query ->
+  case Selecto.explain_analyze(query, format: :text) do
+    {:ok, %{plan_lines: plan_lines}} ->
+      %{lookup: label, plan: Enum.join(plan_lines, "\n")}
+
+    {:error, error} ->
+      %{lookup: label, plan: inspect(error)}
+  end
+end
+
+[
+  plan_lookup.("VALUES", values_lookup_compare_query),
+  plan_lookup.("persisted table", persisted_lookup_query)
+]
+|> Kino.DataTable.new()
+```
+
+## 12) Cleanup Persisted Lookup Table
+
+When you no longer need the persisted-table comparison, drop the temporary table
+from the sample database.
+
+```elixir
+case Ecto.Adapters.SQL.query(config.repo, "drop table if exists livebook_status_lookup", []) do
+  {:ok, _result} ->
+    IO.puts("Dropped livebook_status_lookup")
+
+  {:error, error} ->
+    IO.puts("Could not drop livebook_status_lookup: #{inspect(error)}")
+end
+```
+
+## 13) CSV-Loaded Lookup Rows
+
+Load a tiny CSV string, validate its headers, and feed the rows into
+`with_values/3`.
+
+```elixir
+csv_lookup = """
+status,status_label
+processing,Queued work
+shipped,Carrier handoff
+delivered,Customer received
+cancelled,Stopped
+"""
+
+[header | csv_rows] =
+  csv_lookup
+  |> String.trim()
+  |> String.split("\n")
+  |> Enum.map(&String.split(&1, ","))
+
+true = header == ["status", "status_label"]
+
+csv_lookup_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> ValuesLab.Helpers.with_lookup(%{
+    as: "csv_status_labels",
+    columns: header,
+    rows: csv_rows,
+    owner_key: :status,
+    related_key: :status,
+    fields: %{status: %{type: :string}, status_label: %{type: :string}}
+  })
+  |> Selecto.select(select([order_number, status, csv_status_labels.status_label, total]))
+  |> Selecto.limit(8)
+
+ValuesLab.Helpers.run("CSV-loaded VALUES lookup", csv_lookup_query, 8)
+```
+
+## 14) VALUES Lookup vs JSON Object Lookup
+
+For tiny maps, JSON object lookup can be a compact alternative. VALUES remains
+more explicit when you need typed columns or join metadata.
+
+```elixir
+{:ok, json_lookup_result} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH status_map AS (
+    SELECT '{"processing":"In Progress","shipped":"In Transit","delivered":"Completed","cancelled":"Cancelled"}'::jsonb AS labels
+  )
+  SELECT orders.order_number, orders.status, status_map.labels ->> orders.status AS status_label, orders.total
+  FROM orders
+  CROSS JOIN status_map
+  ORDER BY orders.total DESC
+  LIMIT 10
+  """, [])
+
+json_lookup_result.rows
+```
+
+## 15) Challenge: Add Fulfillment Priority Lookup
+
+Layer a second inline lookup onto the status-label lookup to drive fulfillment
+priority sorting.
+
+```elixir
+fulfillment_priority_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> ValuesLab.Helpers.with_lookup(ValuesLab.Helpers.status_lookup_meta("v1"))
+  |> Selecto.with_values(
+    [
+      ["processing", "1", "work queue"],
+      ["shipped", "2", "carrier"],
+      ["delivered", "3", "done"],
+      ["cancelled", "4", "exception"]
+    ],
+    columns: ["status", "priority_rank", "priority_bucket"],
+    as: "fulfillment_priority",
+    join: [
+      owner_key: :status,
+      related_key: :status,
+      fields: %{
+        status: %{type: :string},
+        priority_rank: %{type: :string},
+        priority_bucket: %{type: :string}
+      }
+    ]
+  )
+  |> Selecto.select(select([order_number, status, status_labels.status_label, fulfillment_priority.priority_rank, fulfillment_priority.priority_bucket, total]))
+  |> Selecto.order_by(order_by([asc(fulfillment_priority.priority_rank), desc(total)]))
+  |> Selecto.limit(12)
+
+ValuesLab.Helpers.run("Second inline lookup for fulfillment priority", fulfillment_priority_query, 12)
+```
+
+## 16) CSV Parser Boundary
+
+Keep the current parser intentionally tiny, and document where a real CSV
+library should take over.
+
+```elixir
+csv_parser_comparison = [
+  %{parser: "String.split", handles_quotes?: false, handles_commas_in_values?: false, dependency: "none"},
+  %{parser: "CSV library", handles_quotes?: true, handles_commas_in_values?: true, dependency: "add when workbook deps allow"}
+]
+
+Kino.DataTable.new(csv_parser_comparison)
+```
+
+## 17) Typed Integer Lookup Columns
+
+Use raw SQL to demonstrate integer priority ranks until lookup field typing
+supports this example directly.
+
+```elixir
+{:ok, typed_priority_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH priority(status, priority_rank, bucket) AS (
+    VALUES
+      ('processing', 1, 'work queue'),
+      ('shipped', 2, 'carrier'),
+      ('delivered', 3, 'done'),
+      ('cancelled', 4, 'exception')
+  )
+  SELECT orders.order_number, orders.status, priority.priority_rank, priority.bucket
+  FROM orders
+  LEFT JOIN priority ON priority.status = orders.status
+  ORDER BY priority.priority_rank, orders.total DESC
+  LIMIT 12
+  """, [])
+
+typed_priority_rows.rows
+```
+
+## 18) Lookup Source Comparison
+
+Compare lookup sources by operational tradeoff.
+
+```elixir
+[
+  %{source: "CSV", best_for: "small maintained lists", tradeoff: "needs parser and validation"},
+  %{source: "JSON object", best_for: "tiny key/value maps", tradeoff: "less column typing"},
+  %{source: "VALUES", best_for: "inline typed query metadata", tradeoff: "query text grows with list size"},
+  %{source: "persisted table", best_for: "shared reference data", tradeoff: "requires migrations and lifecycle"}
+]
+|> Kino.DataTable.new()
+```
+
+## More Next Steps
+
+To extend this workbook further, add:
+
+1. Add a workbook dependency note for CSV parsing options.
+2. Add Selecto `with_values/3` examples once integer field typing is supported end-to-end.
+3. Add lookup freshness checks for persisted reference tables.

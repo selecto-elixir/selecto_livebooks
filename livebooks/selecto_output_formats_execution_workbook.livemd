@@ -1,0 +1,573 @@
+# Selecto Output Formats and Execution Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook focuses on execution-time output options and runtime metadata.
+
+1. Standard execution (`execute/2`) with `rows/columns/aliases`
+2. Rich metadata (`execute_with_metadata/2`)
+3. Single-row contract (`execute_one/2`)
+4. Built-in output formats (`:maps`, `:json`, `:csv`)
+5. Advanced formats (`:typed_maps`, `:stream`)
+
+```mermaid
+flowchart LR
+  query[Selecto query]
+  exec[execute / execute_with_metadata / execute_one]
+  format[format option]
+  result[result payload]
+
+  query --> exec --> result
+  query --> format --> result
+```
+
+```mermaid
+graph TD
+  raw[raw tuple rows]
+  maps[maps]
+  json[json string]
+  csv[csv text]
+  stream[lazy stream]
+
+  raw --> maps
+  raw --> json
+  raw --> csv
+  raw --> stream
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Shared Repo and Load Domains
+
+This cell starts the shared sample-app repo and loads the maintained product and
+order domains from `selecto_livebooks`.
+
+```elixir
+config = SelectoLivebooks.NotebookSupport.config([:product_domain, :order_domain])
+counts = SelectoLivebooks.NotebookSupport.table_counts(["products", "orders"])
+product_count = counts["products"]
+order_count = counts["orders"]
+
+IO.puts("Connected. Products: #{product_count}, Orders: #{order_count}")
+
+config
+```
+
+## Setup 3) Define Helper
+
+This helper prints SQL and parameters once for each query.
+
+```elixir
+defmodule OutputLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+This workbook focuses on execution behavior, but the example queries now use the
+current expression DSL where it keeps the runtime/output examples concise.
+
+```elixir
+import Selecto.ExprMacros
+
+:ok
+```
+
+## 1) Baseline `execute/2` (Raw Tuple Output)
+
+`execute/2` returns `{:ok, {rows, columns, aliases}}` by default.
+
+```elixir
+import Selecto.ExprMacros
+
+raw_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([name, sku, price]))
+  |> Selecto.filter(where(active == true))
+  |> Selecto.order_by(order_by([asc(name)]))
+  |> Selecto.limit(5)
+
+OutputLab.Helpers.explain("Raw execute/2", raw_query)
+
+case Selecto.execute(raw_query) do
+  {:ok, {rows, columns, aliases}} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.puts("Aliases: #{inspect(aliases)}")
+    IO.inspect(rows, label: "Rows")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 2) `execute_with_metadata/2`
+
+Get result data plus metadata like SQL text, params, and execution time.
+
+```elixir
+import Selecto.ExprMacros
+
+metadata_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(3)
+
+OutputLab.Helpers.explain("execute_with_metadata/2", metadata_query)
+
+case Selecto.execute_with_metadata(metadata_query) do
+  {:ok, {rows, columns, _aliases}, metadata} ->
+    IO.puts("Columns: #{inspect(columns)}")
+    IO.inspect(rows, label: "Rows")
+    IO.puts("Metadata keys: #{inspect(Map.keys(metadata))}")
+    IO.puts("Execution time (ms): #{inspect(metadata[:execution_time])}")
+    IO.puts("Metadata params: #{inspect(metadata[:params])}")
+    IO.puts("Metadata SQL:\n#{metadata[:sql]}")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 3) `execute_one/2` Success and Guard Behavior
+
+`execute_one/2` enforces exactly one row.
+
+```elixir
+import Selecto.ExprMacros
+
+one_row_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.order_by(order_by([desc(total)]))
+  |> Selecto.limit(1)
+
+many_rows_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([order_number, status, total]))
+  |> Selecto.filter(where(status == "delivered"))
+  |> Selecto.limit(2)
+
+OutputLab.Helpers.explain("execute_one/2 success case", one_row_query)
+
+case Selecto.execute_one(one_row_query) do
+  {:ok, {row, aliases}} ->
+    IO.puts("Single row: #{inspect(row)}")
+    IO.puts("Aliases: #{inspect(aliases)}")
+
+  {:error, error} ->
+    IO.puts("Unexpected error: #{inspect(error)}")
+end
+
+OutputLab.Helpers.explain("execute_one/2 guard case", many_rows_query)
+
+case Selecto.execute_one(many_rows_query) do
+  {:ok, {row, _aliases}} ->
+    IO.puts("Unexpected single row: #{inspect(row)}")
+
+  {:error, error} ->
+    IO.puts("Expected guard error: #{inspect(error)}")
+end
+```
+
+## 4) Built-in Output Formats (`:maps`, `:json`, `:csv`)
+
+Switch `format` at execution time to get payloads ready for APIs or exports.
+
+```elixir
+import Selecto.ExprMacros
+
+format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([name, sku, price]))
+  |> Selecto.filter(where(active == true))
+  |> Selecto.order_by(order_by([asc(name)]))
+  |> Selecto.limit(5)
+
+OutputLab.Helpers.explain("Formatted output query", format_query)
+
+IO.puts("\nFormat :maps")
+case Selecto.execute(format_query, format: :maps) do
+  {:ok, maps} -> IO.inspect(maps, label: "maps")
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat {:json, [pretty: true]}")
+case Selecto.execute(format_query, format: {:json, [pretty: true]}) do
+  {:ok, json_string} -> IO.puts(json_string)
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat :csv")
+case Selecto.execute(format_query, format: :csv) do
+  {:ok, csv_string} -> IO.puts(csv_string)
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 5) Advanced Formats (`:typed_maps`, `:stream`)
+
+Use type-coerced maps and lazy result transformation. The `{:stream, :maps}`
+format below wraps an already-fetched response: it does not by itself bound
+database-fetch memory or implement a server-side cursor.
+
+```elixir
+import Selecto.ExprMacros
+
+advanced_format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([name, price, active]))
+  |> Selecto.filter(where(active == true))
+  |> Selecto.order_by(order_by([asc(name)]))
+  |> Selecto.limit(10)
+
+OutputLab.Helpers.explain("Advanced format query", advanced_format_query)
+
+IO.puts("\nFormat {:typed_maps, [keys: :strings, coerce: :safe]}")
+case Selecto.execute(advanced_format_query, format: {:typed_maps, [keys: :strings, coerce: :safe]}) do
+  {:ok, typed_maps} ->
+    typed_maps
+    |> Enum.take(5)
+    |> IO.inspect(label: "typed_maps preview")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+
+IO.puts("\nFormat {:stream, :maps}")
+case Selecto.execute(advanced_format_query, format: {:stream, :maps}) do
+  {:ok, row_stream} ->
+    row_stream
+    |> Enum.take(5)
+    |> IO.inspect(label: "stream preview")
+
+  {:error, error} ->
+    IO.puts("Error: #{inspect(error)}")
+end
+```
+
+## 6) `execute_stream/2` Contract Boundaries
+
+`{:stream, ...}` format and `execute_stream/2` are related but not identical.
+
+* `format: {:stream, :maps}` transforms a normal execute response into a lazy stream.
+* `Selecto.execute_stream/2` asks the adapter/connection path to stream rows directly.
+
+For adapter-backed paths, streaming requires an explicit contract:
+
+* adapter must return `true` for `supports?(:stream)`
+* adapter must implement `stream/4`
+* connection input must match what the adapter's `stream/4` accepts
+
+The pinned PostgreSQL adapter's cursor path expects a native Postgrex connection,
+not an Ecto Repo supervisor or connection options. Use an explicit runtime and
+consume the stream before closing that connection. Creating the lazy stream
+alone does not prove that database streaming worked.
+
+Inspect the pinned contract below: Postgrex supplies `{row, columns}` as the
+payload inside Selecto's `{payload, outer_columns, aliases}` wrapper. The outer
+columns are currently empty. This differs from the flat raw-execution tuple;
+do not assume the two APIs are interchangeable. This check records that current
+behavior, not a cross-adapter row-shape guarantee.
+
+```elixir
+import Selecto.ExprMacros
+
+{:ok, stream_connection} =
+  SelectoLivebooks.NotebookSupport.repo_config()
+  |> Keyword.put(:pool_size, 1)
+  |> Postgrex.start_link()
+
+stream_runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, stream_connection)
+
+stream_query =
+  Selecto.configure(config.product_domain, stream_runtime)
+  |> Selecto.select(select([id, name]))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(5)
+
+OutputLab.Helpers.explain("execute_stream/2 query", stream_query)
+
+try do
+  {:ok, {expected_rows, expected_columns, _aliases}} = Selecto.execute(stream_query)
+  {:ok, row_stream} =
+    Selecto.execute_stream(stream_query, analyze_complexity: false, max_rows: 2)
+
+  streamed_rows = Enum.to_list(row_stream)
+  IO.inspect(streamed_rows, label: "pinned cursor stream payload")
+
+  # Generated projection IDs can change between builds; compare data and columns.
+  streamed_data = Enum.map(streamed_rows, fn {{row, columns}, [], _aliases} -> {row, columns} end)
+  true = streamed_data == Enum.map(expected_rows, &{&1, expected_columns})
+  IO.puts("Cursor rows and columns match ordinary execution.")
+after
+  GenServer.stop(stream_connection)
+end
+
+# At the adapter callback boundary, options are not an open connection.
+# Selecto.configure/3 may establish a connection from options, so it is not
+# an invalid-connection probe. Test the callback's actual contract directly.
+{:error, {:invalid_connection, _options}} =
+  SelectoDBPostgreSQL.Adapter.stream(
+    SelectoLivebooks.NotebookSupport.repo_config(), "SELECT 1", [], []
+  )
+```
+
+## 7) Compare `:maps` and `:typed_maps` Overhead
+
+This micro-benchmark keeps the query shape identical and varies only the output
+transformer. Single runs on a tiny dataset mix database/cache latency with
+formatting cost; treat them as instrumentation examples, not performance claims.
+Whole-VM memory deltas later in this workbook also include unrelated processes
+and garbage collection, and can be negative. They are not peak-memory measurements.
+
+```elixir
+benchmark_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([id, name, sku, price, stock_quantity]))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(250)
+
+format_benchmark =
+  for {label, format} <- [
+        {"maps", :maps},
+        {"typed_maps", {:typed_maps, [keys: :strings, coerce: :safe]}}
+      ] do
+    {micros, result} =
+      :timer.tc(fn ->
+        Selecto.execute(benchmark_query, format: format)
+      end)
+
+    rows =
+      case result do
+        {:ok, rows} when is_list(rows) -> length(rows)
+        _ -> 0
+      end
+
+    %{format: label, rows: rows, elapsed_ms: Float.round(micros / 1000, 2)}
+  end
+
+Kino.DataTable.new(format_benchmark)
+```
+
+## 8) Write CSV Output to Disk
+
+Export cells can write the built-in CSV output directly to a file that other
+tools can consume.
+
+```elixir
+export_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([id, sku, name, price, stock_quantity]))
+  |> Selecto.order_by(order_by([asc(sku)]))
+  |> Selecto.limit(100)
+
+export_path = Path.join(System.tmp_dir!(), "selecto_products_#{Ecto.UUID.generate()}.csv")
+
+case Selecto.execute(export_query, format: {:csv, [headers: true]}) do
+  {:ok, csv_string} ->
+    File.write!(export_path, csv_string, [:exclusive])
+    IO.puts("Wrote #{byte_size(csv_string)} bytes to #{export_path}")
+
+  {:error, error} ->
+    IO.puts("CSV export failed: #{inspect(error)}")
+end
+```
+
+## 9) Fold a Stream into Aggregate Statistics
+
+For simple Elixir-side summaries, stream formatted rows and reduce them without
+holding additional derived structures.
+
+```elixir
+stats_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([id, name, price, stock_quantity]))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(250)
+
+case Selecto.execute(stats_query, format: {:stream, :maps}) do
+  {:ok, stream} ->
+    stats =
+      Enum.reduce(stream, %{rows: 0, total_stock: 0, max_price: Decimal.new("0")}, fn row, acc ->
+        price = Map.fetch!(row, "price")
+        max_price = if Decimal.compare(price, acc.max_price) == :gt, do: price, else: acc.max_price
+
+        %{
+          rows: acc.rows + 1,
+          total_stock: acc.total_stock + Map.fetch!(row, "stock_quantity"),
+          max_price: max_price
+        }
+      end)
+
+    IO.inspect(stats, label: "folded stream stats")
+
+  {:error, error} ->
+    IO.puts("stream fold failed: #{inspect(error)}")
+end
+```
+
+## 11) Memory Profile for Wide Result Sets
+
+Inspect a whole-VM memory delta around eager execution. This is not a peak-memory
+measurement or evidence that formatted streams reduce database-fetch memory.
+
+```elixir
+wide_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([id, name, sku, price, stock_quantity, active, featured, tags, metadata]))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(200)
+
+memory_before = :erlang.memory(:total)
+{:ok, wide_rows} = Selecto.execute(wide_query, format: :maps)
+memory_after = :erlang.memory(:total)
+
+%{
+  rows: length(wide_rows),
+  memory_delta_bytes: memory_after - memory_before,
+  sample_keys: wide_rows |> List.first() |> Map.keys()
+}
+```
+
+## 12) JSON-Lines Export from Stream Output
+
+Stream maps and encode each row as one JSON document per line.
+
+```elixir
+json_lines_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([id, name, sku, price]))
+  |> Selecto.order_by(order_by([asc(id)]))
+  |> Selecto.limit(10)
+
+{:ok, json_line_stream} = Selecto.execute(json_lines_query, format: {:stream, :maps})
+
+json_lines_preview =
+  json_line_stream
+  |> Stream.map(&Jason.encode!/1)
+  |> Enum.join("\n")
+
+IO.puts(json_lines_preview)
+```
+
+## 13) Choose an Execution Format
+
+This cell mirrors a Livebook input-driven branch with a single variable so it
+can run unattended during verification.
+
+```elixir
+chosen_format = :typed_maps
+
+format_option =
+  case chosen_format do
+    :raw -> nil
+    :maps -> :maps
+    :typed_maps -> {:typed_maps, [keys: :strings, coerce: :safe]}
+    :csv -> :csv
+  end
+
+interactive_format_query =
+  Selecto.configure(config.product_domain, config.repo)
+  |> Selecto.select(select([name, sku, price]))
+  |> Selecto.order_by(order_by([asc(name)]))
+  |> Selecto.limit(5)
+
+case format_option do
+  nil -> Selecto.execute(interactive_format_query)
+  option -> Selecto.execute(interactive_format_query, format: option)
+end
+|> IO.inspect(label: "chosen execution format: #{chosen_format}", limit: :infinity)
+```
+
+## 14) Format Select Input
+
+Use a select control to choose output format, with a default for unattended
+verification.
+
+```elixir
+format_input =
+  Kino.Input.select("Output format", [{"typed_maps", "typed_maps"}, {"maps", "maps"}, {"csv", "csv"}], default: "typed_maps")
+
+selected_format =
+  try do
+    Kino.Input.read(format_input) || "typed_maps"
+  rescue
+    _ -> "typed_maps"
+  end
+
+selected_option =
+  case selected_format do
+    "typed_maps" -> {:typed_maps, [keys: :strings, coerce: :safe]}
+    "maps" -> :maps
+    "csv" -> :csv
+  end
+
+Selecto.execute(interactive_format_query, format: selected_option)
+|> IO.inspect(label: "selected format result", limit: 20)
+```
+
+## 15) Download-Ready Export Payloads
+
+Prepare CSV and JSON-lines strings that can be handed to a download cell.
+
+```elixir
+{:ok, csv_export} = Selecto.execute(json_lines_query, format: :csv)
+{:ok, export_stream} = Selecto.execute(json_lines_query, format: {:stream, :maps})
+
+download_payloads = %{
+  csv_bytes: byte_size(csv_export),
+  jsonl_bytes: export_stream |> Stream.map(&Jason.encode!/1) |> Enum.join("\n") |> byte_size()
+}
+
+download_payloads
+```
+
+## 16) Memory Delta by Format
+
+Run the same query through several output formats and compare memory deltas.
+
+```elixir
+measure_format = fn label, option ->
+  before_memory = :erlang.memory(:total)
+  result = Selecto.execute(interactive_format_query, format: option)
+  after_memory = :erlang.memory(:total)
+
+  %{format: label, ok?: match?({:ok, _}, result), memory_delta_bytes: after_memory - before_memory}
+end
+
+[
+  measure_format.("maps", :maps),
+  measure_format.("typed maps", {:typed_maps, [keys: :strings, coerce: :safe]}),
+  measure_format.("csv", :csv),
+  measure_format.("stream maps", {:stream, :maps})
+]
+|> Kino.DataTable.new()
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+1. Add `Kino.Download` cells for the export payloads.
+2. Add larger-page benchmarks for stream memory behavior.
+3. Add a format compatibility matrix for each `Selecto.execute/2` option.

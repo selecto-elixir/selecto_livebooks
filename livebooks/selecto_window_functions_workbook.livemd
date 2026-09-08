@@ -1,0 +1,536 @@
+# Selecto Window Functions Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook focuses on analytical window functions that keep row-level detail while adding per-partition metrics.
+
+1. Department ranking with `row_number`
+2. Department average with `avg(...) over (...)`
+3. Running totals with ordered windows
+4. Previous/next comparisons with `lag` and `lead`
+5. Salary banding with `ntile`
+
+```mermaid
+flowchart LR
+  base[Base row selection]
+  partition[Define partition]
+  order[Define order within partition]
+  win[Apply window function]
+  result[Row + analytic columns]
+
+  base --> partition --> order --> win --> result
+```
+
+```mermaid
+graph TD
+  dept[department partition]
+  emp1[employee row]
+  emp2[employee row]
+  emp3[employee row]
+  metric[window metric per row]
+
+  dept --> emp1 --> metric
+  dept --> emp2 --> metric
+  dept --> emp3 --> metric
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+## Setup 2) Connect to Repo and Build Employee Domain
+
+This cell defines a local Repo and an employee-focused domain for window function demos.
+
+```elixir
+defmodule WindowLab.Repo do
+  use Ecto.Repo,
+    otp_app: :window_lab_livebook,
+    adapter: Ecto.Adapters.Postgres
+end
+
+defmodule WindowLab.EmployeeDomain do
+  @moduledoc false
+
+  def domain do
+    %{
+      name: "Employees",
+      source: %{
+        source_table: "employees",
+        primary_key: :id,
+        fields: [
+          :id,
+          :first_name,
+          :last_name,
+          :email,
+          :title,
+          :department,
+          :salary,
+          :hire_date,
+          :active,
+          :manager_id,
+          :inserted_at
+        ],
+        columns: %{
+          id: %{type: :integer},
+          first_name: %{type: :string},
+          last_name: %{type: :string},
+          email: %{type: :string},
+          title: %{type: :string},
+          department: %{type: :string},
+          salary: %{type: :decimal},
+          hire_date: %{type: :date},
+          active: %{type: :boolean},
+          manager_id: %{type: :integer},
+          inserted_at: %{type: :utc_datetime}
+        },
+        associations: %{}
+      },
+      schemas: %{},
+      joins: %{},
+      default_selected: ["first_name", "last_name", "department", "salary"],
+      default_order_by: [{"department", :asc}, {"salary", :desc}]
+    }
+  end
+end
+
+repo_config = [
+  database: System.get_env("SELECTO_LIVEBOOKS_DB", "selecto_livebooks_dev"),
+  username: System.get_env("SELECTO_LIVEBOOKS_DB_USER", "postgres"),
+  password: System.get_env("SELECTO_LIVEBOOKS_DB_PASS", "postgres"),
+  hostname: System.get_env("SELECTO_LIVEBOOKS_DB_HOST", "localhost"),
+  port: String.to_integer(System.get_env("SELECTO_LIVEBOOKS_DB_PORT", "5432")),
+  pool_size: 5
+]
+
+case Process.whereis(WindowLab.Repo) do
+  nil -> {:ok, _pid} = WindowLab.Repo.start_link(repo_config)
+  _pid -> :ok
+end
+
+config = %{
+  repo: WindowLab.Repo,
+  employee_domain: WindowLab.EmployeeDomain.domain()
+}
+
+{:ok, result} = Ecto.Adapters.SQL.query(config.repo, "select count(*) from employees", [])
+[[employee_count]] = result.rows
+IO.puts("Connected. Employees in dataset: #{employee_count}")
+
+config
+```
+
+## Setup 3) Define Window Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule WindowLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query) do
+    Selecto.Livebook.explain(label, query)
+  end
+
+  def run(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+
+  def run_shape(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run_shape(label, query, preview_count: preview_count)
+  end
+end
+```
+
+## 1) Department Salary Rank + Department Average
+
+This query shows each active employee row and adds two analytics:
+
+1. `department_salary_rank` from highest salary to lowest within each department
+2. `department_avg_salary` repeated on each row for quick comparison
+
+```elixir
+department_rank_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:row_number, [],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "department_salary_rank"
+  )
+  |> Selecto.window_function(:avg, ["salary"],
+    over: [partition_by: ["department"]],
+    as: "department_avg_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Department rank + average", department_rank_query)
+```
+
+## 2) Running Department Payroll by Salary Order
+
+This query adds cumulative payroll at each row inside a department, ordered by salary descending.
+
+```elixir
+running_total_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:sum, ["salary"],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "running_department_payroll"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Running department payroll", running_total_query)
+```
+
+## 3) Previous and Next Salary in the Same Department
+
+`lag` and `lead` let you compare each salary row with nearby rows in the same ordered partition.
+
+```elixir
+neighbor_compare_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:lag, ["salary", 1],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "prev_salary"
+  )
+  |> Selecto.window_function(:lead, ["salary", 1],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "next_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run("Lag/lead salary neighbors", neighbor_compare_query)
+```
+
+## 4) Salary Quartiles with `ntile`
+
+`ntile(4)` assigns each row into a quartile bucket based on global salary ordering.
+
+```elixir
+quartile_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select([
+    "first_name",
+    "last_name",
+    "department",
+    "salary"
+  ])
+  |> Selecto.window_function(:ntile, [4],
+    over: [order_by: [{"salary", :desc}]],
+    as: "salary_quartile"
+  )
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(30)
+
+WindowLab.Helpers.run("Global salary quartiles", quartile_query)
+```
+
+## 6) Percentiles and Moving Averages
+
+Window functions can express percentile-style buckets and moving averages while
+preserving employee rows.
+
+```elixir
+percentile_moving_average_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select(["first_name", "last_name", "department", "salary", "hire_date"])
+  |> Selecto.window_function(:percent_rank, [],
+    over: [partition_by: ["department"], order_by: [{"salary", :asc}]],
+    as: "department_salary_percent_rank"
+  )
+  |> Selecto.window_function(:avg, ["salary"],
+    over: [
+      partition_by: ["department"],
+      order_by: [{"hire_date", :asc}],
+      frame: {:rows, {:preceding, 2}, :current_row}
+    ],
+    as: "three_hire_moving_avg_salary"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"hire_date", :asc})
+  |> Selecto.limit(30)
+
+WindowLab.Helpers.run("Percent rank and moving average", percentile_moving_average_query)
+```
+
+## 7) Structured Output with Window Columns
+
+Package row fields and analytic fields into a nested shape for dashboards or API
+payloads.
+
+```elixir
+window_shape_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select_shape([
+    {"first_name", "last_name"},
+    "department",
+    {
+      "salary",
+      {:field,
+       {:raw_sql, "ROW_NUMBER() OVER (PARTITION BY selecto_root.department ORDER BY selecto_root.salary DESC)"},
+       "department_rank"}
+    }
+  ])
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(20)
+
+WindowLab.Helpers.run_shape("Window output shape", window_shape_query)
+```
+
+## 8) Department and Tenure Dashboard Slice
+
+Compare top earners by department and a derived tenure bucket.
+
+```elixir
+tenure_dashboard_query =
+  Selecto.configure(config.employee_domain, config.repo)
+  |> Selecto.filter({"active", true})
+  |> Selecto.select(["first_name", "last_name", "department", "salary", "hire_date"])
+  |> Selecto.case_when_select([
+    {[{"hire_date", {:<, ~D[2019-01-01]}}], "senior tenure"},
+    {[{"hire_date", {:<, ~D[2023-01-01]}}], "mid tenure"}
+  ], else: "newer tenure", as: "tenure_bucket")
+  |> Selecto.window_function(:row_number, [],
+    over: [partition_by: ["department"], order_by: [{"salary", :desc}]],
+    as: "department_top_earner_rank"
+  )
+  |> Selecto.order_by({"department", :asc})
+  |> Selecto.order_by({"salary", :desc})
+  |> Selecto.limit(50)
+
+WindowLab.Helpers.run("Top earners by department and tenure", tenure_dashboard_query)
+```
+
+## 9) Row vs Range Frame Comparison
+
+Compare row-count frames with value-range frames for moving salary totals.
+
+```elixir
+{:ok, frame_comparison} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    department,
+    first_name,
+    last_name,
+    salary,
+    sum(salary) OVER (
+      PARTITION BY department
+      ORDER BY salary
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rows_frame_total,
+    sum(salary) OVER (
+      PARTITION BY department
+      ORDER BY salary
+      RANGE BETWEEN 10000 PRECEDING AND CURRENT ROW
+    ) AS range_frame_total
+  FROM employees
+  ORDER BY department, salary
+  LIMIT 25
+  """, [])
+
+frame_comparison.rows
+```
+
+## 10) CTE Pre-Aggregation with Window Functions
+
+Pre-aggregate each department, then apply a window rank to the summarized rows.
+
+```elixir
+{:ok, department_salary_rank} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  WITH department_summary AS (
+    SELECT department, count(*) AS employee_count, avg(salary) AS average_salary, sum(salary) AS total_salary
+    FROM employees
+    GROUP BY department
+  )
+  SELECT
+    department,
+    employee_count,
+    average_salary,
+    total_salary,
+    dense_rank() OVER (ORDER BY average_salary DESC) AS average_salary_rank
+  FROM department_summary
+  ORDER BY average_salary_rank, department
+  """, [])
+
+department_salary_rank.rows
+```
+
+## 11) Salary Distribution Chart Data by Department Rank
+
+Build a chart-ready dataset from department salary ranks. The cell returns a
+VegaLite-compatible spec and falls back to a table when VegaLite is unavailable.
+
+```elixir
+chart_values =
+  Enum.map(department_salary_rank.rows, fn [department, employee_count, average_salary, total_salary, rank] ->
+    %{
+      department: department,
+      employee_count: employee_count,
+      average_salary: Decimal.to_float(average_salary),
+      total_salary: Decimal.to_float(total_salary),
+      rank: rank
+    }
+  end)
+
+salary_rank_spec = %{
+  "$schema" => "https://vega.github.io/schema/vega-lite/v5.json",
+  "data" => %{"values" => chart_values},
+  "mark" => "bar",
+  "encoding" => %{
+    "x" => %{"field" => "department", "type" => "nominal", "sort" => "-y"},
+    "y" => %{"field" => "average_salary", "type" => "quantitative"},
+    "color" => %{"field" => "rank", "type" => "ordinal"}
+  }
+}
+
+if Code.ensure_loaded?(VegaLite) do
+  VegaLite.from_json(Jason.encode!(salary_rank_spec))
+else
+  Kino.DataTable.new(chart_values)
+end
+```
+
+## 12) Interactive Frame and Department Controls
+
+Use input-style values to change the moving frame size and department filter.
+
+```elixir
+frame_size_input = Kino.Input.number("Rows preceding", default: 2)
+department_input = Kino.Input.text("Department", default: "Engineering")
+
+read_or = fn input, default ->
+  try do
+    Kino.Input.read(input) || default
+  rescue
+    _ -> default
+  end
+end
+
+frame_size = read_or.(frame_size_input, 2)
+department_filter = read_or.(department_input, "Engineering")
+
+{:ok, controlled_frame_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    department,
+    first_name,
+    last_name,
+    salary,
+    avg(salary) OVER (
+      PARTITION BY department
+      ORDER BY salary
+      ROWS BETWEEN #{frame_size} PRECEDING AND CURRENT ROW
+    ) AS moving_average
+  FROM employees
+  WHERE department = $1
+  ORDER BY salary
+  LIMIT 20
+  """, [department_filter])
+
+controlled_frame_rows.rows
+```
+
+## 13) Percentile and Distribution Functions
+
+Add distribution windows alongside rank functions.
+
+```elixir
+{:ok, distribution_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    department,
+    first_name,
+    last_name,
+    salary,
+    percent_rank() OVER (PARTITION BY department ORDER BY salary) AS percent_rank,
+    cume_dist() OVER (PARTITION BY department ORDER BY salary) AS cumulative_distribution,
+    ntile(4) OVER (PARTITION BY department ORDER BY salary) AS salary_quartile
+  FROM employees
+  ORDER BY department, salary
+  LIMIT 30
+  """, [])
+
+distribution_rows.rows
+```
+
+## 14) Cumulative Salary Curve Spec
+
+Build chart-ready values for cumulative salary curves by department.
+
+```elixir
+{:ok, cumulative_salary_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    department,
+    salary,
+    sum(salary) OVER (PARTITION BY department ORDER BY salary) AS cumulative_salary
+  FROM employees
+  ORDER BY department, salary
+  """, [])
+
+cumulative_values =
+  Enum.map(cumulative_salary_rows.rows, fn [department, salary, cumulative_salary] ->
+    %{department: department, salary: Decimal.to_float(salary), cumulative_salary: Decimal.to_float(cumulative_salary)}
+  end)
+
+%{
+  mark: "line",
+  data: %{values: cumulative_values},
+  encoding: %{
+    x: %{field: "salary", type: "quantitative"},
+    y: %{field: "cumulative_salary", type: "quantitative"},
+    color: %{field: "department", type: "nominal"}
+  }
+}
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+1. Validate frame-size input before interpolating it into SQL.
+2. Add percentile examples for order totals and product prices.
+3. Render cumulative curves when VegaLite is available.

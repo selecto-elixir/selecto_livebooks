@@ -1,0 +1,156 @@
+# New Domain Contracts: Validation, Consumer Registries, and Releases
+
+The domain now describes more than columns and joins. This workbook explores
+colocated write policy, computed predicates, dependency declarations, operation
+and experience registries, and deterministic consumer releases. It runs without
+a database and distinguishes validation from downstream execution support.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_core!()
+```
+
+## 1) Validate before inspecting or projecting
+
+`Selecto.Domain.validate/1` produces a normalized contract and diagnostics.
+The inspection/projection helpers can normalize without full validation, so
+validate authored input first. `Selecto.configure/3` continues to consume the
+authored runtime domain; a consumer projection is a separate artifact.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+base = SelectoLivebooks.ActionFixture.domain()
+assert {:ok, normalized, diagnostics} = Selecto.Domain.validate(base)
+assert normalized.writes.fields.state == %{updatable: true}
+assert diagnostics.unknown_sections == [:tenant_required]
+
+query_projection = Selecto.Domain.project(normalized, :query)
+write_projection = Selecto.Domain.project(normalized, :write)
+ui_projection = Selecto.Domain.project(normalized, :ui)
+refute Map.has_key?(query_projection, :actions)
+assert write_projection.actions.approve.execution.operation == :update
+assert ui_projection.actions.approve.selection.eligibility_field == :eligible
+```
+
+The fixture's runtime `tenant_required` flag is still classified as an unknown
+top-level schema section. Validation retains it for compatibility; an unknown
+section diagnostic does not necessarily mean runtime behavior is absent. The
+write-side tenant policy is declared separately under `writes.scope.tenant`.
+
+## 2) Declare consumer dependencies and application experiences
+
+`domain_dependencies`, `operations`, `experiences`, and `co_domains` are canonical
+schema-v1 sections in this pinned snapshot. The dependency declares which
+provider surface is consumed. Its version and fingerprint values are metadata:
+the validator does not contact that provider or prove compatibility with it.
+
+`operations` names consumer operation contracts, while `writes.operations`
+authorizes relational insert/update/delete behavior. `actions` supplies executable
+action templates. `experiences` records host-consumed UI/application definitions.
+These similarly named sections serve different purposes.
+
+```elixir
+domain = Map.merge(base, %{
+  domain_dependencies: [%{
+    provider: :carrier_directory, contract: "carrier_lookup_v1", accepts: "~> 1.0",
+    uses: %{fields: [:id, :name, :city], filters: [], query_members: []},
+    satisfies: [:tenant_id]
+  }],
+  operations: %{approve: %{version: "1.0.0", description: "Approve a ready item"}},
+  experiences: %{"approval-queue" => %{operation: :approve, layout: :table}}
+})
+assert {:ok, normalized, diagnostics} = Selecto.Domain.validate(domain)
+for section <- [:domain_dependencies, :operations, :experiences] do
+  assert section in diagnostics.canonical_sections
+end
+assert {:ok, inspection, _} = Selecto.Domain.describe(normalized)
+assert inspection.counts.domain_dependencies == 1
+assert inspection.registries.operations == [:approve]
+assert inspection.registries.experiences == ["approval-queue"]
+inspection.counts
+```
+
+The registries validate IDs and map shapes. An experience declaration does not
+by itself render a UI, register a route, or guarantee that an operation exists
+in a deployed consumer. Those are integration responsibilities.
+
+## 3) Inspect the constrained query contract
+
+This projection exposes named fields and query vocabulary to tooling. The
+`internal` flag supports UI behavior; it must not be used as a secrecy boundary.
+Redaction, capabilities and host policy need their own explicit design.
+
+```elixir
+assert {:ok, query_contract, _} = Selecto.Domain.query_contract(normalized)
+assert query_contract.projection == :query_contract
+field_ids = Enum.map(query_contract.fields, & &1.id)
+assert "id" in field_ids
+assert "state" in field_ids
+%{fields: field_ids, capabilities: query_contract.capability_ids}
+```
+
+## 4) Reject malformed definitions at authoring time
+
+Unknown dependency keys, malformed registries, non-boolean eligibility fields,
+and cycles in computed predicates produce diagnostics with codes and paths.
+
+```elixir
+malformed = Map.merge(domain, %{
+  domain_dependencies: [%{provider: "", contract: nil, surface: :obsolete}],
+  experiences: []
+})
+assert {:error, invalid} = Selecto.Domain.validate(malformed)
+codes = Enum.map(invalid.errors, & &1.code)
+assert :invalid_domain_dependency_identifier in codes
+assert :unknown_domain_dependency_key in codes
+assert :invalid_section_shape in codes
+
+bad_eligibility = put_in(base, [:actions, :approve, :selection, :eligibility_field], :state)
+assert {:error, invalid_eligibility} = Selecto.Domain.validate(bad_eligibility)
+assert Enum.any?(invalid_eligibility.errors, &(&1.code == :invalid_action_eligibility_field))
+
+cyclic = put_in(base, [:source, :columns, :eligible, :computed, :expression], [:eq, :eligible, true])
+assert {:error, cycle} = Selecto.Domain.validate(cyclic)
+assert Enum.any?(cycle.errors, &(&1.code == :computed_predicate_cycle))
+
+Enum.map(invalid.errors, &Map.take(&1, [:code, :path]))
+```
+
+## 5) Build a reproducible consumer release
+
+This release carries operation and experience registries plus the nested
+composition contract. Our domain has no nested relationships, so it requires
+no nested runtime features. Choose a real runtime/adapter target when checking
+a domain with composition; passing a fabricated supported-feature list would
+only assert support, not establish it.
+
+```elixir
+options = [projection_id: "approval-queue", runtime: "selecto_updato", adapter: "postgresql"]
+assert {:ok, release} = Selecto.Domain.consumer_projection_release(domain, options)
+assert {:ok, same_release} = Selecto.Domain.consumer_projection_release(domain, Enum.reverse(options))
+assert release == same_release
+assert release["fingerprint"] =~ "sha256:"
+assert release["operations"]["approve"]["version"] == "1.0.0"
+assert release["experiences"]["approval-queue"]["operation"] == "approve"
+assert [%{"id" => "approve", "version" => "1.0.0"}] = release["dependencies"]["operations"]
+
+changed = put_in(domain, [:operations, :approve, :version], "2.0.0")
+assert {:ok, changed_release} = Selecto.Domain.consumer_projection_release(changed, options)
+refute release["fingerprint"] == changed_release["fingerprint"]
+assert {:error, %{code: :incomplete_consumer_target}} =
+  Selecto.Domain.consumer_projection_release(domain, runtime: "selecto_updato")
+
+Map.take(release, ["projection_id", "fingerprint", "required_features", "dependencies"])
+```
+
+A changed hash detects changed content; it is not an authorization signature.
+The current release compatibility diff concentrates on relationship semantics,
+so it must not be treated as a general operation-version compatibility checker.
+Inspect the actual registries and the consuming application's contract too.
+
+Try [action planning](selecto_actions_workbook.livemd) for typed variants and
+capability decisions, then [co-domain lookups](selecto_co_domains_workbook.livemd)
+for executable search scope and computed eligibility.

@@ -1,0 +1,553 @@
+# Selecto Group-By and Aggregates Workbook
+
+## Setup 1) Install Dependencies
+
+Run this cell first. It installs the local `selecto_livebooks` project and its
+current Selecto dependencies for this Livebook session.
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install!()
+```
+
+## Overview
+
+This workbook focuses on aggregation patterns that are common in reporting and analytics:
+
+1. Global totals (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
+2. Single-dimension grouping (for example, by status)
+3. Multi-dimension grouping (for example, country + status)
+4. Join-aware aggregates (for example, customer tier metrics)
+5. Composable multi-`select/2` aggregate query construction
+6. Top-N product metrics from `order_items`
+
+```mermaid
+flowchart LR
+  base[Configure query]
+  selects[Add aggregate selects]
+  filters[Apply filters]
+  groups[Group dimensions]
+  order[Order by aggregate]
+  run[Execute and inspect]
+
+  base --> selects --> filters --> groups --> order --> run
+```
+
+```mermaid
+graph LR
+  orders[orders]
+  customers[customers]
+  order_items[order_items]
+  products[products]
+
+  orders -->|customer_id to id| customers
+  orders -->|id to order_id| order_items
+  order_items -->|product_id to id| products
+```
+
+Before running, initialize the sample database:
+
+```bash
+mix setup
+```
+
+### ROLLUP Ordering Compatibility Note
+
+PostgreSQL 16/17 can ignore `NULLS FIRST` ordering in some `GROUP BY ROLLUP`
+cases unless ordering is applied in an outer query level. Selecto applies a
+`rollupfix` wrapper for this compatibility path.
+
+Starting with PostgreSQL 18, planner behavior is improved for this case.
+In Selecto versions that include PG18 detection, the compatibility wrapper is
+auto-disabled on PG18+ and retained for older PostgreSQL versions.
+
+```elixir
+pg_major = SelectoLivebooks.NotebookSupport.postgres_major_version()
+
+IO.puts("PostgreSQL major version: #{pg_major}")
+```
+
+## Setup 2) Connect to Shared Repo and Load Domains
+
+This cell starts the shared sample-app repo and loads the maintained order and
+order-items domains from `selecto_livebooks`.
+
+```elixir
+config = SelectoLivebooks.NotebookSupport.config([:order_domain, :order_items_domain])
+counts = SelectoLivebooks.NotebookSupport.table_counts(["orders", "order_items"])
+order_count = counts["orders"]
+item_count = counts["order_items"]
+
+IO.puts("Connected. Orders: #{order_count}, Order items: #{item_count}")
+
+config
+```
+
+## Setup 3) Define Aggregate Helpers
+
+This helper cell prints SQL/params and executes a query with a compact preview.
+
+```elixir
+defmodule AggregateLab.Helpers do
+  @moduledoc false
+
+  def explain(label, query), do: Selecto.Livebook.explain(label, query)
+
+  def run(label, query, preview_count \\ 10) do
+    Selecto.Livebook.run(label, query, preview_count: preview_count)
+  end
+
+  def money(nil), do: "$0.00"
+  def money(%Decimal{} = value), do: "$" <> (value |> Decimal.round(2) |> Decimal.to_string())
+  def money(value) when is_number(value), do: "$" <> :erlang.float_to_binary(value / 1, decimals: 2)
+  def money(value), do: inspect(value)
+end
+```
+
+## Setup 4) Current Expression DSL Imports
+
+This workbook now uses the current expression DSL in its core aggregate examples.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+:ok
+```
+
+## 1) Global Totals (No Group By)
+
+Start with a baseline aggregate query over all orders to get total count, distinct customers, and revenue metrics in one row.
+
+```elixir
+import Selecto.ExprMacros
+
+global_totals_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(
+    select([
+      as(count(), "order_count"),
+      as(count_distinct(customer_id), "customer_count"),
+      as(sum(total), "gross_total"),
+      as(avg(total), "avg_total"),
+      as(min(total), "min_total"),
+      as(max(total), "max_total")
+    ])
+  )
+
+AggregateLab.Helpers.run("Global totals", global_totals_query)
+```
+
+## 2) Orders by Status
+
+Group by `status` to build a compact operational dashboard that shows volume and revenue by lifecycle stage.
+
+```elixir
+import Selecto.ExprMacros
+
+status_summary_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([status, as(count(), "order_count"), as(sum(total), "gross_total"), as(avg(total), "avg_total")]))
+  |> Selecto.group_by(group_by([status]))
+  |> Selecto.order_by({{:count, "*"}, :desc})
+
+AggregateLab.Helpers.run("Order summary by status", status_summary_query)
+```
+
+## 3) Country and Status Matrix (Two-Dimension Group By)
+
+Group across two dimensions (`shipping_country` and `status`) to inspect where order outcomes are concentrated.
+
+```elixir
+import Selecto.ExprMacros
+
+country_status_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([shipping_country, status, as(count(), "order_count"), as(sum(total), "gross_total")]))
+  |> Selecto.group_by(group_by([shipping_country, status]))
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(20)
+
+AggregateLab.Helpers.run("Country + status matrix", country_status_query)
+```
+
+## 4) Join-Aware Aggregates by Customer Tier
+
+Use joined customer fields as grouping dimensions and filters while still aggregating order totals from the root table.
+
+```elixir
+import Selecto.ExprMacros
+
+tier_country_summary_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(
+    select([
+      customer.tier,
+      customer.country,
+      as(count(), "order_count"),
+      as(sum(total), "gross_total"),
+      as(avg(total), "avg_total")
+    ])
+  )
+  |> Selecto.filter(where(customer.active == true))
+  |> Selecto.group_by(group_by([customer.tier, customer.country]))
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+  |> Selecto.limit(15)
+
+AggregateLab.Helpers.run("Join-aware tier + country summary", tier_country_summary_query)
+```
+
+## 5) Composable Aggregate Query with Multiple `select/2` Calls
+
+This cell intentionally builds the select list in stages to show composability: you can add dimensions and aggregates incrementally before execution.
+
+```elixir
+import Selecto.ExprMacros
+
+composable_aggregate_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([status]))
+  |> Selecto.select(select([as(count(), "order_count")]))
+  |> Selecto.select(select([as(sum(total), "gross_total")]))
+  |> Selecto.select(select([as(avg(total), "avg_total")]))
+  |> Selecto.group_by(group_by([status]))
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+
+AggregateLab.Helpers.run("Composable multi-select aggregate", composable_aggregate_query)
+```
+
+## 6) Distinct Reach per Customer Tier
+
+Pair `COUNT(*)` with `COUNT DISTINCT` to compare raw order volume against breadth (how many unique shipping countries each tier reaches).
+
+```elixir
+import Selecto.ExprMacros
+
+distinct_reach_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(
+    select([
+      customer.tier,
+      as(count(), "order_count"),
+      as(count_distinct(shipping_country), "country_reach"),
+      as(sum(total), "gross_total")
+    ])
+  )
+  |> Selecto.group_by(group_by([customer.tier]))
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+
+AggregateLab.Helpers.run("Distinct reach by tier", distinct_reach_query)
+```
+
+## 7) Top Products by Revenue from Order Items
+
+Switch to the `order_items` domain to aggregate at line-item granularity and rank products by revenue and units sold.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+top_products_query =
+  Selecto.configure(config.order_items_domain, config.repo)
+  |> Selecto.select(
+    select([
+      product.name,
+      product.sku,
+      as(count_distinct(order_id), "order_count"),
+      as(sum(quantity), "units_sold"),
+      as(sum(line_total), "gross_total")
+    ])
+  )
+  |> Selecto.filter(X.in("order.status", ["shipped", "delivered"]))
+  |> Selecto.group_by(group_by([product.name, product.sku]))
+  |> Selecto.order_by({{:sum, "line_total"}, :desc})
+  |> Selecto.limit(10)
+
+AggregateLab.Helpers.run("Top products by shipped/delivered revenue", top_products_query)
+```
+
+## 8) Side-by-Side Aggregate Comparison in Elixir
+
+Run two aggregate queries (delivered-only and pending-only) and compare the resulting totals in Elixir for quick ad hoc analysis.
+
+```elixir
+import Selecto.ExprMacros
+
+alias Selecto.Expr, as: X
+
+delivered_total_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([as(count(), "order_count"), as(sum(total), "gross_total"), as(avg(total), "avg_total")]))
+  |> Selecto.filter(where(status == "delivered"))
+
+pending_total_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([as(count(), "order_count"), as(sum(total), "gross_total"), as(avg(total), "avg_total")]))
+  |> Selecto.filter(where(status == "pending"))
+
+{:ok, {[delivered_row], _cols1, _aliases1}} = Selecto.execute(delivered_total_query)
+{:ok, {[pending_row], _cols2, _aliases2}} = Selecto.execute(pending_total_query)
+
+[delivered_count, delivered_sum, delivered_avg] = delivered_row
+[pending_count, pending_sum, pending_avg] = pending_row
+
+IO.puts("Delivered: #{delivered_count} orders, total #{AggregateLab.Helpers.money(delivered_sum)}, avg #{AggregateLab.Helpers.money(delivered_avg)}")
+IO.puts("Pending:   #{pending_count} orders, total #{AggregateLab.Helpers.money(pending_sum)}, avg #{AggregateLab.Helpers.money(pending_avg)}")
+```
+
+## 9) Time-Bucketed Aggregate Trends
+
+Use `date_trunc` as a grouping selector to build month-level order trends.
+
+```elixir
+monthly_trend_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select([
+    {:field, {:raw_sql, "date_trunc('month', inserted_at)"}, "order_month"}
+  ])
+  |> Selecto.select(select([as(count(), "order_count"), as(sum(total), "gross_total")]))
+  |> Selecto.group_by([{:raw_sql, "date_trunc('month', inserted_at)"}])
+
+AggregateLab.Helpers.run("Monthly order trends", monthly_trend_query, 24)
+```
+
+## 10) Order-Level to Product-Level Aggregate Flow
+
+Join through order items and products to pivot the question from order volume to
+product contribution in one grouped query.
+
+```elixir
+product_contribution_query =
+  Selecto.configure(config.order_items_domain, config.repo)
+  |> Selecto.select(select([
+    product.name,
+    as(sum(quantity), "units_sold"),
+    as(sum(line_total), "product_revenue"),
+    as(count_distinct(order_id), "order_reach")
+  ]))
+  |> Selecto.filter(where(order.status != "cancelled"))
+  |> Selecto.group_by(group_by([product.name]))
+  |> Selecto.order_by({{:sum, "line_total"}, :desc})
+  |> Selecto.limit(20)
+
+AggregateLab.Helpers.run("Product contribution from order flow", product_contribution_query, 20)
+```
+
+## 11) Chart-Ready Aggregate Maps
+
+Execution formats make it easy to hand aggregate rows to charting cells without
+manual column zipping.
+
+```elixir
+chart_source_query =
+  Selecto.configure(config.order_domain, config.repo)
+  |> Selecto.select(select([status, as(count(), "order_count"), as(sum(total), "gross_total")]))
+  |> Selecto.group_by(group_by([status]))
+  |> Selecto.order_by({{:sum, "total"}, :desc})
+
+case Selecto.execute(chart_source_query, format: {:typed_maps, [keys: :strings, coerce: :safe]}) do
+  {:ok, rows} ->
+    rows
+    |> Enum.map(fn row ->
+      %{
+        status: row["status"],
+        order_count: row["order_count"],
+        gross_total: Decimal.to_float(row["gross_total"])
+      }
+    end)
+    |> Kino.DataTable.new()
+
+  {:error, error} ->
+    IO.puts("chart map export failed: #{inspect(error)}")
+end
+```
+
+## 12) Rollup and Cube Subtotal Rows
+
+PostgreSQL `ROLLUP` and `CUBE` emit subtotal rows that are already suitable for
+chart or export pipelines.
+
+```elixir
+{:ok, rollup_result} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    coalesce(status, 'ALL_STATUSES') AS status,
+    coalesce(shipping_country, 'ALL_COUNTRIES') AS shipping_country,
+    count(*) AS order_count,
+    sum(total) AS gross_total
+  FROM orders
+  GROUP BY ROLLUP(status, shipping_country)
+  ORDER BY status, shipping_country
+  LIMIT 20
+  """, [])
+
+{:ok, cube_result} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT
+    coalesce(status, 'ALL_STATUSES') AS status,
+    coalesce(shipping_country, 'ALL_COUNTRIES') AS shipping_country,
+    count(*) AS order_count,
+    sum(total) AS gross_total
+  FROM orders
+  GROUP BY CUBE(status, shipping_country)
+  ORDER BY status, shipping_country
+  LIMIT 20
+  """, [])
+
+%{
+  rollup_rows: rollup_result.rows,
+  cube_rows: cube_result.rows
+}
+```
+
+## 13) HAVING-Style Aggregate Filters
+
+Use a raw aggregate predicate in `HAVING` when the grouped result should only
+include dimensions above a threshold.
+
+```elixir
+{:ok, having_result} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT status, count(*) AS order_count, sum(total) AS gross_total
+  FROM orders
+  GROUP BY status
+  HAVING sum(total) >= $1
+  ORDER BY gross_total DESC
+  """, [Decimal.new("10000")])
+
+having_result.rows
+```
+
+## 14) VegaLite Bar Spec from Aggregate Maps
+
+Export typed aggregate maps and place them into a VegaLite-compatible bar-chart
+spec. If the VegaLite package is available in the Livebook runtime, render it;
+otherwise show the spec as data.
+
+```elixir
+{:ok, aggregate_chart_rows} =
+  Selecto.execute(chart_source_query, format: {:typed_maps, [keys: :strings, coerce: :safe]})
+
+vega_values =
+  Enum.map(aggregate_chart_rows, fn row ->
+    %{
+      status: row["status"],
+      gross_total: Decimal.to_float(row["gross_total"]),
+      order_count: row["order_count"]
+    }
+  end)
+
+vega_spec = %{
+  "$schema" => "https://vega.github.io/schema/vega-lite/v5.json",
+  "data" => %{"values" => vega_values},
+  "mark" => "bar",
+  "encoding" => %{
+    "x" => %{"field" => "status", "type" => "nominal"},
+    "y" => %{"field" => "gross_total", "type" => "quantitative"},
+    "tooltip" => [
+      %{"field" => "status", "type" => "nominal"},
+      %{"field" => "order_count", "type" => "quantitative"},
+      %{"field" => "gross_total", "type" => "quantitative"}
+    ]
+  }
+}
+
+if Code.ensure_loaded?(VegaLite) do
+  VegaLite.from_json(Jason.encode!(vega_spec))
+else
+  Kino.DataTable.new(vega_values)
+end
+```
+
+## 15) Grouping Set Helper Specs
+
+Represent ROLLUP/CUBE requests as validated specs until Selecto-native grouping
+set helpers exist.
+
+```elixir
+grouping_set_specs = [
+  %{helper: :rollup, dimensions: ["status", "shipping_country"], sql: "ROLLUP(status, shipping_country)"},
+  %{helper: :cube, dimensions: ["status", "shipping_country"], sql: "CUBE(status, shipping_country)"}
+]
+
+Kino.DataTable.new(grouping_set_specs)
+```
+
+## 16) Reusable HAVING Builder
+
+Keep aggregate predicates in a tiny builder so callers choose from known
+aggregate expressions and operators.
+
+```elixir
+having_builder = fn aggregate, operator, threshold ->
+  aggregate_sql =
+    case aggregate do
+      :gross_total -> "sum(total)"
+      :order_count -> "count(*)"
+    end
+
+  operator_sql =
+    case operator do
+      :gte -> ">="
+      :gt -> ">"
+    end
+
+  {aggregate_sql <> " " <> operator_sql <> " $1", [threshold]}
+end
+
+{having_sql, having_params} = having_builder.(:gross_total, :gte, Decimal.new("10000"))
+
+{:ok, having_helper_rows} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT status, count(*) AS order_count, sum(total) AS gross_total
+  FROM orders
+  GROUP BY status
+  HAVING #{having_sql}
+  ORDER BY gross_total DESC
+  """, having_params)
+
+having_helper_rows.rows
+```
+
+## 17) Stacked Bar and Subtotal Chart Specs
+
+Reuse aggregate maps to produce chart specs for stacked bars and subtotal-aware
+tables.
+
+```elixir
+{:ok, stacked_result} =
+  Ecto.Adapters.SQL.query(config.repo, """
+  SELECT status, shipping_country, count(*) AS order_count
+  FROM orders
+  GROUP BY status, shipping_country
+  ORDER BY status, shipping_country
+  """, [])
+
+stacked_values =
+  Enum.map(stacked_result.rows, fn [status, country, count] ->
+    %{status: status, country: country, order_count: count}
+  end)
+
+%{
+  stacked_bar_spec: %{
+    "data" => %{"values" => stacked_values},
+    "mark" => "bar",
+    "encoding" => %{
+      "x" => %{"field" => "status", "type" => "nominal"},
+      "y" => %{"field" => "order_count", "type" => "quantitative"},
+      "color" => %{"field" => "country", "type" => "nominal"}
+    }
+  },
+  subtotal_rows: Enum.take(rollup_result.rows, 5)
+}
+```
+
+## Next Steps
+
+To extend this workbook further, add:
+
+1. Turn grouping-set specs into a small reusable notebook module.
+2. Add HAVING builders for AVG, MIN, and MAX.
+3. Render stacked and subtotal charts when VegaLite is available.

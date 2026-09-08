@@ -1,0 +1,89 @@
+# Evolving Nested Domain Contracts Safely
+
+Nested writes are a consumer contract, not just a server implementation detail.
+This workbook publishes projection-specific snapshots and classifies changes to
+relationship modes and bounds before a runtime consumes them.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Compile a stable consumer release
+
+```elixir
+import ExUnit.Assertions
+alias Selecto.Domain.ConsumerProjectionRelease
+
+domain = Selecto.Domain.CompositionFixtures.order_document()
+assert {:ok, previous} = ConsumerProjectionRelease.compile(domain,
+  projection_id: "order-editor", consumer: "warehouse-ui", version: "1.0.0")
+assert previous["composition"]["relationships"]["items"]["write"]["max_items"] == 200
+assert is_binary(previous["fingerprint"])
+
+assert {:ok, same_again} = ConsumerProjectionRelease.compile(domain,
+  projection_id: "order-editor", consumer: "warehouse-ui", version: "1.0.0")
+assert same_again["fingerprint"] == previous["fingerprint"]
+```
+
+## 2) Recognize a compatible expansion
+
+Raising an upper bound accepts everything the old consumer could submit, so the
+relationship diff classifies it as compatible.
+
+```elixir
+expanded = put_in(domain, [:writes, :relationships, "items", :write, :max_items], 250)
+assert {:ok, expanded_release} = ConsumerProjectionRelease.compile(expanded,
+  projection_id: "order-editor", consumer: "warehouse-ui", version: "1.1.0")
+expanded_diff = ConsumerProjectionRelease.diff(previous, expanded_release)
+
+assert expanded_diff.classification == :compatible
+assert %{path: "items.write.max_items", kind: :changed, classification: :compatible} in
+  expanded_diff.changes
+```
+
+## 3) Stop a breaking narrowing
+
+Removing `full_set` and lowering the collection limit invalidate requests that
+were legal under the previous release.
+
+```elixir
+narrowed =
+  domain
+  |> put_in([:writes, :relationships, "items", :write, :modes], [:delta])
+  |> put_in([:writes, :relationships, "items", :write, :max_items], 50)
+
+assert {:ok, narrowed_release} = ConsumerProjectionRelease.compile(narrowed,
+  projection_id: "order-editor", consumer: "warehouse-ui", version: "2.0.0")
+narrowed_diff = ConsumerProjectionRelease.diff(previous, narrowed_release)
+
+assert narrowed_diff.classification == :breaking
+assert Enum.any?(narrowed_diff.changes, &(&1.path == "items.write.modes" and &1.kind == :narrowed))
+assert Enum.any?(narrowed_diff.changes, &(&1.path == "items.write.max_items" and &1.kind == :narrowed))
+```
+
+## 4) Match the release to a certified consumer target
+
+Declaring only half a target fails closed. A runtime/adapter pair carries its
+supported feature profile into the release; that profile is evidence metadata,
+not a promise about arbitrary host callbacks or databases.
+
+```elixir
+assert {:error, %{code: :incomplete_consumer_target}} =
+  ConsumerProjectionRelease.compile(domain, runtime: "selecto_updato")
+
+assert {:ok, executable_release} = ConsumerProjectionRelease.compile(domain,
+  projection_id: "order-executor",
+  runtime: "selecto_updato", adapter: "postgresql", feature_scope: :execution)
+assert executable_release["target"]["runtime"] == "selecto_updato"
+assert executable_release["feature_scope"] == "execution"
+assert executable_release["required_features"] != []
+```
+
+Persist release documents beside deployed consumers and compare old-to-new in
+CI. The diff is relationship-specific; ordinary field/API versioning still
+needs its own compatibility policy.
+Continue with [nested writes](selecto_updato_nested_writes_workbook.livemd) to
+execute the order/item relationship contract.
