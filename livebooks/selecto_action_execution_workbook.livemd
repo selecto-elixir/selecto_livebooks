@@ -1,0 +1,161 @@
+# Execute Domain Actions: Preview, Row Guards, and Bulk Rollback
+
+An enabled action can become invalid before the user clicks Apply. This workbook
+checks declarative guards in the actual PostgreSQL update and verifies the data
+after both success and failure. It uses five synthetic rows in one temporary
+table. Set `SELECTO_LIVEBOOKS_DB*` for an existing disposable PostgreSQL database.
+No Ecto Repo, migrations, or e-commerce seeds are needed.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_updato!()
+```
+
+## 1) Start the fixture and define the host execution boundary
+
+The [fixture](support/action_fixture.exs) supplies the same domain used in the
+[planning workbook](selecto_actions_workbook.livemd). The host adapter owns the
+connection and tenant context. Preserve the context provided by
+`ActionExecutionAdapter`: it includes phase-bound authorization evidence.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+connection = SelectoLivebooks.ActionFixture.connect!()
+domain = SelectoLivebooks.ActionFixture.domain()
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, connection)
+target = Selecto.configure(domain, runtime)
+
+defmodule ApprovalHost do
+  @behaviour SelectoUpdato.ActionExecutionAdapter
+
+  def execute_action(plan, context, _opts) do
+    operation = SelectoUpdato.with_tenant(plan.operation_builder, context.tenant)
+    SelectoUpdato.execute(operation, context.query_target, context: context)
+  end
+
+  def dry_run_action(plan, context, _opts) do
+    operation = SelectoUpdato.with_tenant(plan.operation_builder, context.tenant)
+    SelectoUpdato.preview(operation, context.query_target, context: context)
+  end
+end
+
+context = %{actor: %{id: 17, role: :approver}, tenant: %{tenant_id: 101}, query_target: target}
+policy = fn request, ctx, _opts ->
+  if request.capability == "approvals.approve" and ctx.actor.role == :approver,
+    do: :enabled, else: :hidden
+end
+plan_for = fn selected_target ->
+  {:ok, plan} = SelectoUpdato.plan_domain_action(domain,
+    %{action: :approve, target: selected_target}, trusted_context: %{actor_id: context.actor.id})
+  plan
+end
+snapshot = fn ->
+  Postgrex.query!(connection,
+    "SELECT id, tenant_id, state, ready, reviewed_by_id FROM livebook_approvals ORDER BY id", []).rows
+end
+initial_rows = snapshot.()
+```
+
+## 2) Preview without changing a row
+
+Preview compiles SQL under a preview authorization grant. The transition and
+readiness guard are in the same update predicate as the target and tenant.
+The host can show the statement and bound values to an operator.
+
+```elixir
+plan = plan_for.(1)
+assert {:ok, preview} = SelectoUpdato.ActionExecutionAdapter.dry_run(
+  ApprovalHost, plan, context, capability_resolver: policy)
+assert snapshot.() == initial_rows
+assert [%{text: sql, params: params}] = preview.statements
+assert sql =~ ~r/\bupdate\b/i
+for field <- ["id", "tenant_id", "state", "ready"] do
+  assert sql =~ field
+end
+assert 101 in params
+assert "open" in params
+assert true in params
+%{sql: sql, params: params}
+```
+
+## 3) Missing or denied authorization leaves data unchanged
+
+```elixir
+assert {:error, {:validation_error, _, %{code: :missing_capability_resolver}}} =
+  SelectoUpdato.ActionExecutionAdapter.execute(ApprovalHost, plan, context)
+denied_context = put_in(context, [:actor, :role], :reader)
+assert {:error, {:validation_error, _, %{status: :hidden}}} =
+  SelectoUpdato.ActionExecutionAdapter.execute(ApprovalHost, plan, denied_context,
+    capability_resolver: policy)
+assert snapshot.() == initial_rows
+```
+
+## 4) Execute, then reject a repeated transition
+
+```elixir
+assert {:ok, result} = SelectoUpdato.ActionExecutionAdapter.execute(
+  ApprovalHost, plan, context, capability_resolver: policy)
+assert result.affected_rows == 1
+after_approval = snapshot.()
+assert [1, 101, "approved", true, 17] in after_approval
+
+assert {:error, %SelectoUpdato.Error{type: :cardinality_mismatch,
+  details: %{expected: {:exactly, 1}, actual: 0}}} = SelectoUpdato.ActionExecutionAdapter.execute(
+  ApprovalHost, plan, context, capability_resolver: policy)
+assert snapshot.() == after_approval
+```
+
+## 5) A plan cannot freeze eligibility or switch tenants
+
+First plan for ready row 4, then simulate another request revoking readiness.
+The update must reevaluate the guard. Row 3 belongs to tenant 202; a target ID
+alone cannot bring it into tenant 101's write scope. SQL NULL also fails the
+`ready = true` predicate for row 5.
+
+```elixir
+stale_plan = plan_for.(4)
+Postgrex.query!(connection, "UPDATE livebook_approvals SET ready = false WHERE id = 4", [])
+before_rejections = snapshot.()
+for rejected_plan <- [stale_plan, plan_for.(3), plan_for.(5)] do
+  assert {:error, %SelectoUpdato.Error{type: :cardinality_mismatch,
+    details: %{expected: {:exactly, 1}, actual: 0}}} = SelectoUpdato.ActionExecutionAdapter.execute(
+    ApprovalHost, rejected_plan, context, capability_resolver: policy)
+  assert snapshot.() == before_rejections
+end
+```
+
+## 6) Roll back a partially matching bulk selection
+
+Restore row 4 for this experiment. Row 2 remains ineligible. The selected IDs
+require two updates, but only one matches. The adapter enforces cardinality
+inside a transaction, so row 4 must remain open after the failed bulk action.
+
+```elixir
+Postgrex.query!(connection, "UPDATE livebook_approvals SET ready = true WHERE id = 4", [])
+before_bulk = snapshot.()
+bulk_plan = plan_for.(%{ids: [2, 4]})
+assert bulk_plan.expected_cardinality == {:exactly, 2}
+assert {:error, %SelectoUpdato.Error{type: :cardinality_mismatch,
+  details: %{expected: {:exactly, 2}, actual: 1}}} = SelectoUpdato.ActionExecutionAdapter.execute(
+  ApprovalHost, bulk_plan, context, capability_resolver: policy)
+assert snapshot.() == before_bulk
+assert [4, 101, "open", true, nil] in before_bulk
+```
+
+The error details explain the failed match/cardinality contract. The assertions
+also verify database state, so an error after a partial commit cannot pass.
+UI eligibility and preview results help the user; execution-time authorization,
+tenant scope, and row guards determine whether the mutation succeeds.
+
+## 7) Close the fixture
+
+```elixir
+:ok = GenServer.stop(connection)
+```
+
+Closing the session removes its temporary table. These cases exercise the pinned
+PostgreSQL adapter. A production host still owns confirmation handling, audit
+persistence, authentication, and any operation-specific membership checks.

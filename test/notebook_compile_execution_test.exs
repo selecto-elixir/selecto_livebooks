@@ -5,6 +5,13 @@ defmodule SelectoLivebooks.NotebookCompileExecutionTest do
   @repo_root Path.expand("..", __DIR__)
   @runner Path.join(@repo_root, "scripts/verify_notebook.exs")
   @workbooks [
+    "selecto_action_authorization_lifecycle_workbook.livemd",
+    "selecto_action_form_workbook.livemd",
+    "selecto_action_observability_workbook.livemd",
+    "selecto_actions_workbook.livemd",
+    "selecto_choice_membership_workbook.livemd",
+    "selecto_domain_contracts_workbook.livemd",
+    "selecto_domain_evolution_workbook.livemd",
     "selecto_first_query_workbook.livemd",
     "selecto_query_library_workbook.livemd",
     "selecto_strict_mode_workbook.livemd",

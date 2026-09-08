@@ -1,0 +1,117 @@
+# Action Audit and Observability Boundary
+
+Action metadata can produce a structured audit envelope, but the host decides
+when and where to persist it. This workbook separates denied attempts, failed
+execution, and committed outcomes without a database.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Define a host-owned audit sink
+
+The adapter records only after its simulated execution succeeds. `Agent` is an
+ephemeral demonstration sink, not a production audit store.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+
+defmodule LivebookAuditedActionAdapter do
+  def execute_action(plan, context, opts) do
+    case Keyword.get(opts, :outcome, :ok) do
+      :ok ->
+        event = Map.put(context.action_audit, :outcome, :committed)
+        Agent.update(Keyword.fetch!(opts, :audit_sink), &[event | &1])
+        {:ok, %{action: plan.action, affected_rows: 1}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def dry_run_action(plan, context, _opts) do
+    {:ok, %{action: plan.action, audit_preview: context.action_audit}}
+  end
+end
+
+{:ok, audit_sink} = Agent.start_link(fn -> [] end)
+domain = SelectoLivebooks.ActionFixture.domain()
+enabled = fn _request, _context, _opts -> :enabled end
+denied = fn _request, _context, _opts ->
+  %{status: :disabled, reason: "Approval limit exceeded", code: :approval_limit}
+end
+
+new_plan = fn ->
+  {:ok, plan} = SelectoUpdato.plan_domain_action(domain,
+    %{action: :approve, target: 1}, trusted_context: %{actor_id: 17})
+  plan
+end
+```
+
+## 2) Keep preview non-durable
+
+The preview receives the same declared envelope with phase `:preview`, while the
+committed-event sink remains empty.
+
+```elixir
+context = %{actor: %{id: 17}, tenant: %{tenant_id: 101}, preview_id: "preview-42"}
+assert {:ok, preview} = SelectoUpdato.ActionExecutionAdapter.dry_run(
+  LivebookAuditedActionAdapter, new_plan.(), context,
+  capability_resolver: enabled, audit_sink: audit_sink
+)
+assert preview.audit_preview.event == "approval.approved"
+assert preview.audit_preview.phase == :preview
+assert preview.audit_preview.actor == %{id: 17}
+assert Agent.get(audit_sink, & &1) == []
+```
+
+## 3) Distinguish denial and execution failure
+
+A policy denial never invokes the adapter. An invoked adapter can still fail;
+neither case is written as a committed outcome.
+
+```elixir
+assert {:error, {:validation_error, "Approval limit exceeded", %{code: :approval_limit}}} =
+  SelectoUpdato.ActionExecutionAdapter.execute(
+    LivebookAuditedActionAdapter, new_plan.(), context,
+    capability_resolver: denied, audit_sink: audit_sink
+  )
+
+assert {:error, :simulated_conflict} = SelectoUpdato.ActionExecutionAdapter.execute(
+  LivebookAuditedActionAdapter, new_plan.(), context,
+  capability_resolver: enabled, audit_sink: audit_sink,
+  outcome: {:error, :simulated_conflict}
+)
+assert Agent.get(audit_sink, & &1) == []
+```
+
+## 4) Persist the successful outcome
+
+```elixir
+assert {:ok, %{affected_rows: 1}} = SelectoUpdato.ActionExecutionAdapter.execute(
+  LivebookAuditedActionAdapter, new_plan.(), context,
+  capability_resolver: enabled, audit_sink: audit_sink
+)
+
+assert [event] = Agent.get(audit_sink, &Enum.reverse/1)
+assert event.event == "approval.approved"
+assert event.phase == :execute
+assert event.action == "approve"
+assert event.capability == "approvals.approve"
+assert event.target == 1
+assert event.outcome == :committed
+assert event.timestamp =~ ~r/^\d{4}-\d{2}-\d{2}T/
+
+:ok = Agent.stop(audit_sink)
+event
+```
+
+Production systems commonly record attempts and outcomes separately. Keep
+secrets out of declared audit inputs/metadata, make sink failure policy explicit,
+and correlate preview/apply using a host-generated identifier.
+See [guarded execution](selecto_action_execution_workbook.livemd) for the native
+PostgreSQL adapter path.

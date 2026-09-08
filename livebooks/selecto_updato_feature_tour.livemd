@@ -8,6 +8,10 @@ configured database adapter owns SQL, driver interaction, transactions, and
 affected-row cardinality checks. The companion nested-write workbook continues
 from commands into atomic `Selecto.Write.Graph` execution.
 
+For named business operations, follow [domain actions](selecto_actions_workbook.livemd)
+and [guarded action execution](selecto_action_execution_workbook.livemd). They add
+input variants, capabilities, transitions and preconditions above the write surface.
+
 It uses Postgrex directly. There is no `Ecto.Repo`, schema, changeset, or Ecto
 configuration in this write path.
 

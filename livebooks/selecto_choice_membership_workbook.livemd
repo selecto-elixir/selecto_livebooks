@@ -1,0 +1,123 @@
+# From Lookup Choice to Governed Write
+
+A lookup result is a candidate, not write authorization. This workbook carries a
+selected value into an Updato update and makes the host revalidate current
+membership, tenant scope, and business status before SQL can be compiled.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_verification!()
+```
+
+## 1) Declare the choice source on the writable field
+
+The choice source names a governed lookup contract. The host remains responsible
+for resolving it; Selecto does not open another domain or trust a browser label.
+
+```elixir
+import ExUnit.Assertions
+
+domain = %{
+  source: %{
+    source_table: "work_items", primary_key: :id,
+    fields: [:id, :assignee_id],
+    columns: %{
+      id: %{type: :integer},
+      assignee_id: %{type: :integer, choice_source: :assignees}
+    },
+    associations: %{}
+  },
+  schemas: %{},
+  choice_sources: %{
+    assignees: %{domain: :people, value_field: :id, label_field: :name}
+  },
+  writes: %{
+    operations: %{update: %{enabled: true}},
+    fields: %{assignee_id: %{updatable: true}}
+  }
+}
+
+assert :ok = SelectoUpdato.validate_domain(domain)
+```
+
+## 2) Treat the lookup response as untrusted request data
+
+This synthetic response has the same boundary as a co-domain result returned to
+a client. Only the value is submitted. Its label is presentation data and is not
+copied into the mutation.
+
+```elixir
+lookup_result = %{value: "7", label: "Ada — active"}
+submitted_value = String.to_integer(lookup_result.value)
+assert submitted_value == 7
+```
+
+## 3) Revalidate membership while compiling the write
+
+The resolver receives the typed value, equality-filter record context, trusted
+tenant, and host-supplied choice filters. A real host can rerun the co-domain's
+active/member predicate here or call an equivalent policy service.
+
+```elixir
+test_pid = self()
+active_members = MapSet.new([{7, 7}])
+
+resolver = fn %Selecto.Domain.Choices.Request{} = request ->
+  send(test_pid, {:membership_check, request})
+
+  if MapSet.member?(active_members, {request.tenant, request.value}) and
+       request.filters == [{:tenant_id, 7}] do
+    Selecto.Domain.Choices.valid(:active_tenant_member)
+  else
+    Selecto.Domain.Choices.invalid(:outside_current_choice_set)
+  end
+end
+
+operation =
+  domain
+  |> SelectoUpdato.new(
+    tenant: %{tenant_id: 7},
+    choice_source_filters: [{:tenant_id, 7}],
+    choice_source_membership_resolver: resolver
+  )
+  |> SelectoUpdato.filter({:id, 42})
+  |> SelectoUpdato.update(%{assignee_id: submitted_value})
+
+assert {:ok, %Selecto.Write.Command{} = command, _context} =
+  SelectoUpdato.PortableCommand.compile(operation)
+assert_receive {:membership_check, request}
+assert request.value == 7
+assert request.record == %{id: 42, assignee_id: 7}
+assert request.tenant == 7
+assert request.metadata == %{surface: :updato, operation: :update}
+command
+```
+
+## 4) Fail closed when the proof is absent or stale
+
+Removing the resolver is an error, not an implicit allow. A value that was once
+visible but is now inactive or belongs to another tenant is rejected too.
+
+```elixir
+without_resolver =
+  domain
+  |> SelectoUpdato.new()
+  |> SelectoUpdato.filter({:id, 42})
+  |> SelectoUpdato.update(%{assignee_id: 7})
+
+assert {:error, %SelectoUpdato.Error{
+  type: :validation,
+  details: %{code: :choice_membership_resolver_required, fields: ["assignee_id"]}
+}} = SelectoUpdato.PortableCommand.compile(without_resolver)
+
+outside_choice_set = %{operation | changes: %{assignee_id: 8}}
+assert {:error, %SelectoUpdato.Error{type: :validation}} =
+  SelectoUpdato.PortableCommand.compile(outside_choice_set)
+assert_receive {:membership_check, %{value: 8}}
+```
+
+The same rule applies to action inputs: display choices may be cached, but
+membership must be checked against trusted current context at preview/apply time.
+See [governed lookups](selecto_co_domains_workbook.livemd) for the read side.

@@ -462,6 +462,11 @@ view_drift_check.(
 
 ## Next Steps
 
+Continue with [new domain contracts](selecto_domain_contracts_workbook.livemd)
+for dependency/consumer registries and validation, or
+[co-domain lookups](selecto_co_domains_workbook.livemd) for scoped search and
+computed action eligibility.
+
 1. Write the generated fixture contract to an artifact during docs validation
 2. Add examples for overlay deletion/removal semantics if supported
 3. Promote the view drift function into a reusable Mix task

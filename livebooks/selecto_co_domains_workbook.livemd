@@ -1,0 +1,187 @@
+# Governed Lookups and Computed Action Eligibility
+
+A lookup field should use the target domain's approved projection and filters.
+An action checkbox should reflect the row's current eligibility. This workbook
+executes both patterns with PostgreSQL, using session-local temporary tables.
+It needs an existing database through `SELECTO_LIVEBOOKS_DB*`, with no migrations
+or sample-app seeds.
+
+## Setup
+
+```elixir
+Code.require_file(Path.expand("support/bootstrap.exs", __DIR__))
+SelectoLivebooksNotebookBootstrap.install_components!()
+```
+
+## 1) Compute eligibility in the root query
+
+The shared domain declares `eligible` as a boolean predicate over `state` and
+`ready`. There is no physical `eligible` database column. The SQL expression
+evaluates it with the row, avoiding a separate policy request for each checkbox.
+`internal: true` is a UI hint; it does not enforce access control.
+
+```elixir
+import ExUnit.Assertions
+Code.require_file(Path.expand("support/action_fixture.exs", __DIR__))
+connection = SelectoLivebooks.ActionFixture.connect!()
+source = SelectoLivebooks.ActionFixture.domain()
+runtime = Selecto.Runtime.Context.new(SelectoDBPostgreSQL.Adapter, connection)
+
+queue =
+  Selecto.configure(source, runtime)
+  |> Selecto.with_tenant(tenant_id: 101)
+  |> Selecto.apply_tenant_scope()
+  |> Selecto.select(["id", "eligible"])
+  |> Selecto.order_by({"id", :asc})
+
+{sql, params} = Selecto.to_sql(queue)
+refute sql =~ "selecto_root.eligible"
+assert "open" in params
+assert true in params
+assert {:ok, {rows, _, _}} = Selecto.execute(queue)
+assert rows == [[1, true], [2, false], [4, true], [5, nil]]
+
+records = Map.new(rows, fn [id, eligible] ->
+  {to_string(id), %{field_values: %{"eligible" => eligible}}}
+end)
+assert SelectoComponents.Actions.eligible_selected_ids(
+  source.actions.approve, ["1", "2", "3", "4", "5", "999"], records) == ["1", "4"]
+%{sql: sql, rows: rows}
+```
+
+Unknown eligibility (`NULL`) and missing records do not enable selection.
+The predicate grammar here is `[:and, [[:eq, field, value], ...]]`; action
+preconditions have their own filter grammar. At apply time the host still
+enforces capability, tenant, transition and readiness guards, as demonstrated
+in [guarded actions](selecto_action_execution_workbook.livemd).
+
+## 2) Give the target domain its own lookup view
+
+These carriers are synthetic. Two tenants have a carrier beginning with
+“Alpine,” and one carrier in tenant 101 is inactive. The query-library segment
+and required tenant filter must exclude those unsuitable matches.
+
+```elixir
+Postgrex.query!(connection, """
+CREATE TEMP TABLE livebook_carriers (
+  id bigint PRIMARY KEY, tenant_id bigint NOT NULL, name text NOT NULL,
+  city text NOT NULL, active boolean NOT NULL
+)
+""", [])
+for row <- [
+  [10, 101, "Alpine Freight", "Denver", true],
+  [11, 101, "Alpine Retired", "Boulder", false],
+  [12, 202, "Alpine Other Tenant", "Denver", true],
+  [13, 101, "Coastal Transport", "Seattle", true]
+] do
+  Postgrex.query!(connection, "INSERT INTO livebook_carriers VALUES ($1,$2,$3,$4,$5)", row)
+end
+
+defmodule CarrierLookupLibrary do
+  use Selecto.QueryLibrary.DSL
+  defsegment active_carriers do
+    where(:active, eq: true)
+  end
+  defprojection label do
+    fields([:id, :name, :city])
+  end
+  defordering name_order do
+    order_by(:name, :asc)
+    order_by(:id, :asc)
+  end
+  defview carrier_lookup do
+    segment(:active_carriers)
+    projection(:label)
+    ordering(:name_order)
+  end
+end
+
+carrier_domain = %{
+  name: "Carrier lookup", tenant_required: true,
+  source: %{
+    source_table: "livebook_carriers", primary_key: :id,
+    fields: [:id, :tenant_id, :name, :city, :active],
+    columns: %{
+      id: %{type: :integer}, tenant_id: %{type: :integer},
+      name: %{type: :string}, city: %{type: :string, label: "City"},
+      active: %{type: :boolean}
+    }, associations: %{}
+  },
+  schemas: %{}, joins: %{}, query_library: CarrierLookupLibrary.query_library()
+}
+target =
+  Selecto.configure(carrier_domain, runtime, mode: :strict)
+  |> Selecto.with_tenant(tenant_id: 101)
+  |> Selecto.apply_tenant_scope()
+```
+
+## 3) Declare and execute the source's co-domain lookup
+
+The source names a target domain and a view. The host resolves that declaration
+to the configured target and supplies its trusted scope. The declaration does
+not open a connection or authenticate a user. In this notebook the target is
+explicit; a host with several targets should resolve through an allowlist.
+
+```elixir
+source = Map.put(source, :co_domains, %{
+  carriers: %{
+    domain: :carrier, view: :carrier_lookup,
+    search: %{fields: [:name, :city], mode: :prefix, configuration: "simple", rank: true},
+    result: %{value_field: :id, label_field: :name, description_fields: [:city]}
+  }
+})
+assert {:ok, normalized, diagnostics} = Selecto.Domain.validate(source)
+assert :co_domains in diagnostics.canonical_sections
+assert Selecto.Domain.project(normalized, :ui).co_domains == source.co_domains
+
+lookup_plan = Selecto.CoDomain.plan(source, target, :carriers, "Alp", limit: 5)
+{lookup_sql, lookup_params} = Selecto.to_sql(lookup_plan.query)
+assert "alp:*" in lookup_params
+assert 101 in lookup_params
+assert true in lookup_params
+refute lookup_sql =~ "alp:*"
+
+assert {:ok, %{results: results}} =
+  Selecto.CoDomain.lookup(source, target, :carriers, "Alp", limit: 5)
+assert [%{value: "10", label: "Alpine Freight", description: "City Denver"}] = results
+results
+```
+
+Return `results` to the client. The returned `query` contains host-side metadata.
+Search text is bound; rank ordering comes before the named target ordering.
+Keep pagination limits and endpoint authorization in the host.
+
+## 4) Reject malformed or broadened requests
+
+Prefix punctuation with no tokens returns an empty result. A caller-supplied
+scope is conjoined with the target's required scope; a conflicting tenant cannot
+replace it. Projection mistakes fail during planning.
+
+```elixir
+assert {:ok, %{results: []}} = Selecto.CoDomain.lookup(source, target, :carriers, "!!!")
+assert {:ok, %{results: []}} = Selecto.CoDomain.lookup(source, target, :carriers, "Alp",
+  scope: {"tenant_id", 202})
+assert_raise ArgumentError, fn -> Selecto.CoDomain.plan(source, target, :carriers, "") end
+assert_raise ArgumentError, fn -> Selecto.CoDomain.plan(source, target, :carriers, "Alp", limit: 101) end
+assert_raise ArgumentError, fn -> Selecto.CoDomain.plan(source, target, :missing, "Alp") end
+
+bad_projection = put_in(source, [:co_domains, :carriers, :result, :label_field], :active)
+assert_raise ArgumentError, ~r/absent from its projection/, fn ->
+  Selecto.CoDomain.plan(bad_projection, target, :carriers, "Alp")
+end
+```
+
+A chosen lookup value is presentation data. Revalidate membership, tenant and
+current business rules when saving an action input. The local LiveView frontend
+does not yet implement every grouped/co-domain action-input control; executing
+this lookup does not demonstrate such a control.
+
+## 5) Close the isolated session
+
+```elixir
+:ok = GenServer.stop(connection)
+```
+
+Both temporary tables disappear. To rerun, begin at the fixture cell with a new
+connection. For validation of dependency and consumer declarations, continue
+with [domain contracts](selecto_domain_contracts_workbook.livemd).

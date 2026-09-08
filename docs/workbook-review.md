@@ -1,5 +1,70 @@
 # Livebook relevance review — September 2026
 
+The September review now covers 33 notebooks, with a dedicated action and
+domain-contract learning path.
+
+## September 5: application boundary follow-through
+
+Five database-free workbooks close the next practical gaps exposed by the
+action/domain track:
+
+| Workbook | Executable boundary |
+| --- | --- |
+| `selecto_choice_membership_workbook.livemd` | Carries an untrusted lookup value into a typed update; proves the membership resolver receives tenant/filter/record context; rejects missing proof and a stale/cross-tenant value. |
+| `selecto_action_form_workbook.livemd` | Exercises Components action normalization, variant inputs, modal request emission, host preview/apply authorization, reload metadata, and denial state without claiming browser rendering. |
+| `selecto_action_authorization_lifecycle_workbook.livemd` | Issues a phase-bound grant, consumes it once, rejects replay and altered plans, and expires an unused grant. |
+| `selecto_domain_evolution_workbook.livemd` | Builds deterministic consumer releases and classifies expanded bounds as compatible and narrowed modes/bounds as breaking. |
+| `selecto_action_observability_workbook.livemd` | Passes a declared audit envelope through preview/execute and records only a simulated committed outcome, distinguishing policy denial and adapter failure. |
+
+These examples deliberately keep host responsibilities visible. Lookup labels
+are not mutation proof, modal events do not execute writes, authorization grants
+are not durable tokens, relationship diffs do not version ordinary fields, and
+an audit envelope is not automatic persistence. The database-free execution
+gate now covers 13 notebooks; the PostgreSQL fixture and seeded counts remain
+six and 14 respectively.
+
+## September 4: actions and newer domain features
+
+The four new workbooks target implemented APIs in the shared dependency snapshot:
+
+| Workbook | What the reader builds and checks |
+| --- | --- |
+| `selecto_actions_workbook.livemd` | Named approval/review actions, typed discriminators, required variant inputs, trusted context, opaque plans, preview/apply capability decisions, Components presentation, and concrete bulk cardinality. |
+| `selecto_action_execution_workbook.livemd` | A host execution adapter with a native Postgrex connection; preview without writes, authorization rejection, successful transition, repeat/stale/NULL/other-tenant rejection, and rollback when one of two bulk rows matches. |
+| `selecto_co_domains_workbook.livemd` | SQL-computed eligibility, hidden selection fields, NULL/missing eligibility, a target-owned lookup view, tenant and active-row filtering, bound prefix search, and invalid/projection-mismatch cases. |
+| `selecto_domain_contracts_workbook.livemd` | Colocated write normalization, diagnostic categories, consumer projections, canonical dependency/operation/experience registries, invalid shapes and computed cycles, and deterministic consumer releases. |
+
+All four share the established bootstrap; a small action fixture supplies a
+complete domain and five synthetic temporary rows. The two database-free
+notebooks are added to the default execution gate, and the other two to the
+temporary-table PostgreSQL gate. The index now contains eight database-free,
+six temporary-fixture, and 14 seeded reference notebooks.
+
+Important boundaries are demonstrated where they matter: `internal: true` is
+a UI hint, lookup results do not authorize a selected value, a capability preview
+does not grant later execution, and action guards run in the mutation predicate.
+Consumer registry validation checks declaration shapes; it does not discover
+providers, render experiences, or certify deployed operation implementations.
+The runtime `tenant_required` key remains classified as unknown by the section
+registry; the contract notebook explicitly shows that compatibility diagnostic.
+
+The new work does not claim that grouped/co-domain action-input controls have
+been implemented in LiveView, or that audit metadata automatically persists an
+audit event. The host execution example passes authorization context through
+unchanged and leaves authentication, confirmation UI, and audit storage with
+the host application.
+
+Verification for these additions used Elixir 1.20 and an isolated PostgreSQL
+18.6 cluster. The local default suite passed 33 checks with the database port
+deliberately unreachable; the local live gate executed all six temporary-table
+notebooks successfully. The new action execution notebook was also rerun after
+tightening its cardinality-error assertions. With published dependencies,
+`mix deps.get --check-locked` succeeded and `mix test --include postgres` passed
+34 checks with the seeded gate excluded. All four additions therefore executed
+in both dependency modes. Formatting and whitespace checks passed. The unchanged
+14 seeded references were parsed but not re-executed during this addition;
+their earlier execution evidence is recorded separately below.
+
 ## Audience and decisions
 
 The original 20 workbooks have broad SQL-feature coverage. The main gap was
